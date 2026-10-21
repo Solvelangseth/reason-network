@@ -122,6 +122,8 @@ pub struct Net {
     endpoint: Endpoint,
     /// Where teammates are dialed: the team's own relay (nothing looks them up on n0's DNS then), or the default ones.
     relays: Vec<RelayUrl>,
+    /// The proxy the relays are reached through, or none for directly.
+    proxy: Option<RelayUrl>,
     router: Mutex<Option<Router>>,
     /// Endpoints listening for joins on behalf of invite codes, by their (code-derived) id.
     invites: Mutex<HashMap<EndpointId, Router>>,
@@ -137,38 +139,267 @@ pub struct Net {
     next_link: AtomicU64,
 }
 
-pub async fn bind(key: SecretKey, relay: Option<&str>, lan: bool) -> Result<Endpoint> {
-    let Some(url) = relay else {
-        // The default relays, with n0's address lookup still: that is how a teammate on an older Reason Network (on
-        // n0's relays) and this machine find each other, and what four-word codes need.
-        let relays = crate::relays::current_or_fetch().await;
-        let mut b = Endpoint::builder(presets::N0).secret_key(key).relay_mode(RelayMode::custom(relays));
-        if lan {
-            b = b.address_lookup(MdnsAddressLookup::builder());
+/// How long a relay gets to answer one way (directly, or through the proxy) when the other way is still worth trying.
+const FIRST_WAY: Duration = Duration::from_secs(5);
+const OTHER_WAY: Duration = Duration::from_secs(10);
+
+/// The relays an endpoint uses: the team's own (`relay`), or the default ones (fetching the list on a first start).
+pub async fn relays_for(relay: Option<&str>) -> Result<Vec<RelayUrl>> {
+    Ok(match relay {
+        None => crate::relays::current_or_fetch().await,
+        Some(url) => {
+            vec![url.parse().map_err(|_| anyhow!("not a relay url: {url} (expected e.g. https://relay.example.com)"))?]
         }
-        return Ok(b.bind().await?);
+    })
+}
+
+/// Where the way to the relays that last got through is kept: present when that was the proxy.
+fn route_file() -> std::path::PathBuf {
+    crate::paths::home().join("relay-proxy")
+}
+
+/// The proxy to reach `relays` through: one is set (see [`proxy_for`]) and it is what last got through. Otherwise
+/// relays are reached directly, as without a proxy: a proxy variable can be stale (a VPN's, a debugging proxy's) while
+/// the internet is right there.
+fn route(relays: &[RelayUrl]) -> Option<RelayUrl> {
+    route_file().exists().then(|| proxy_for(relays)).flatten()
+}
+
+fn keep_route(proxy: &Option<RelayUrl>) {
+    let r = match proxy {
+        Some(_) => std::fs::write(route_file(), "the relays last answered through the proxy\n"),
+        None => std::fs::remove_file(route_file())
+            .or_else(|e| if e.kind() == std::io::ErrorKind::NotFound { Ok(()) } else { Err(e) }),
     };
-    // The team's own relay and nothing of n0's: none of its relays, no publishing or looking up addresses in its DNS.
-    // Teammates are dialed through the relay instead.
-    let url: RelayUrl =
-        url.parse().map_err(|_| anyhow!("not a relay url: {url} (expected e.g. https://relay.example.com)"))?;
-    let mut b = Endpoint::builder(presets::Minimal).secret_key(key.clone()).relay_mode(RelayMode::custom([url]));
-    if lan {
+    if let Err(e) = r {
+        log(&format!("couldn't keep the way to the relays: {e}"));
+    }
+}
+
+/// An endpoint on the team's own relay (`relay`) or the default ones, the way that last got through, at once. A
+/// running network that stays off its relays tries the other way itself (see `route_loop`).
+pub async fn bind(key: SecretKey, relay: Option<&str>, lan: bool) -> Result<Endpoint> {
+    let relays = relays_for(relay).await?;
+    endpoint(&key, &relays, relay.is_some(), lan, route(&relays)).await
+}
+
+/// The same, for something a person waits on anyway (a join, checking a relay): if no relay answers the usual way
+/// and a proxy is set, the other way is tried, and kept if it gets through. Also the relays, for what to say if not.
+pub async fn bind_settled(key: SecretKey, relay: Option<&str>, lan: bool) -> Result<(Endpoint, Vec<RelayUrl>)> {
+    let relays = relays_for(relay).await?;
+    let own = relay.is_some();
+    let first = route(&relays);
+    let endpoint = self::endpoint(&key, &relays, own, lan, first.clone()).await?;
+    let Some(proxy) = proxy_for(&relays) else { return Ok((endpoint, relays)) };
+    if tokio::time::timeout(FIRST_WAY, endpoint.online()).await.is_ok() {
+        return Ok((endpoint, relays));
+    }
+    let other = if first.is_some() { None } else { Some(proxy) };
+    log(&format!("no relay {} ({}): trying {}", way(&first), unreached(&endpoint), way(&other)));
+    if !reaches(&relays, &other).await {
+        log(&format!("no relay {} either", way(&other)));
+        return Ok((endpoint, relays));
+    }
+    endpoint.close().await;
+    keep_route(&other);
+    log(&format!("on a relay {}", way(&other)));
+    Ok((self::endpoint(&key, &relays, own, lan, other).await?, relays))
+}
+
+/// Whether a relay answers the `proxy` way, asked by a throwaway endpoint that publishes nothing (this machine's own
+/// stays as it is).
+async fn reaches(relays: &[RelayUrl], proxy: &Option<RelayUrl>) -> bool {
+    let Ok(probe) = endpoint(&SecretKey::generate(), relays, true, false, proxy.clone()).await else { return false };
+    let reached = tokio::time::timeout(OTHER_WAY, probe.online()).await.is_ok();
+    probe.close().await;
+    reached
+}
+
+async fn endpoint(
+    key: &SecretKey,
+    relays: &[RelayUrl],
+    own: bool,
+    lan: bool,
+    proxy: Option<RelayUrl>,
+) -> Result<Endpoint> {
+    // The default relays, with n0's address lookup still: that is how a teammate on an older Reason Network (on n0's
+    // relays) and this machine find each other, and what four-word codes need. The team's own relay and nothing of
+    // n0's: none of its relays, no publishing or looking up addresses in its DNS; teammates are dialed through it.
+    let relay_mode = RelayMode::custom(relays.to_vec());
+    let mut b = if own { Endpoint::builder(presets::Minimal) } else { Endpoint::builder(presets::N0) }
+        .secret_key(key.clone())
+        .relay_mode(relay_mode);
+    if let Some(p) = proxy {
+        b = b.proxy_url(looked_up(p).await.into());
+    }
+    if lan && own {
         b = b.address_lookup(NoRelays(MdnsAddressLookup::builder().build(key.public())?));
+    } else if lan {
+        b = b.address_lookup(MdnsAddressLookup::builder());
     }
     Ok(b.bind().await?)
+}
+
+/// An http proxy's name looked up the way curl and everything else on this machine looks it up (hosts file, the
+/// system's resolver). iroh would ask DNS servers itself, from an unconnected UDP socket, which some sandboxes refuse,
+/// and a name only the local network knows wouldn't come back from the public ones it falls back to. An https proxy
+/// keeps its name, which its certificate is for.
+async fn looked_up(proxy: RelayUrl) -> RelayUrl {
+    let (Some(host), Some(port)) = (proxy.host_str(), proxy.port_or_known_default()) else { return proxy };
+    if proxy.scheme() != "http" || host.starts_with('[') || host.parse::<std::net::IpAddr>().is_ok() {
+        return proxy;
+    }
+    let found = tokio::time::timeout(Duration::from_secs(5), tokio::net::lookup_host((host.to_string(), port))).await;
+    // One address goes on: IPv4 if there is one (a name for this machine lists ::1 first, where a proxy often isn't).
+    let ips: Vec<std::net::IpAddr> = found.ok().and_then(|r| r.ok()).into_iter().flatten().map(|a| a.ip()).collect();
+    let Some(&ip) = ips.iter().find(|ip| ip.is_ipv4()).or(ips.first()) else { return proxy };
+    let mut url: <RelayUrl as std::ops::Deref>::Target = proxy.clone().into();
+    if url.set_ip_host(ip).is_err() {
+        return proxy;
+    }
+    url.into()
+}
+
+/// "directly", or "through the proxy at host:port" (where it is, not who signs in to it).
+fn way(proxy: &Option<RelayUrl>) -> String {
+    match proxy {
+        Some(p) => {
+            format!("through the proxy at {}:{}", p.host_str().unwrap_or("?"), p.port_or_known_default().unwrap_or(0))
+        }
+        None => "directly".into(),
+    }
 }
 
 /// Makes sure this machine reaches `url` as a relay. Nothing falls back to n0's, so a mistyped or unreachable relay
 /// would cut the team off.
 pub async fn check_relay(key: SecretKey, url: &str) -> Result<()> {
-    let endpoint = bind(key, Some(url), false).await?;
+    let (endpoint, relays) = bind_settled(key, Some(url), false).await?;
     let reached = tokio::time::timeout(Duration::from_secs(10), endpoint.online()).await.is_ok();
+    let why = off_relay(&endpoint, &relays);
     endpoint.close().await;
     if !reached {
-        bail!("couldn't reach relay {url} from this machine: is it running, and is the address right?");
+        let why = why.map(|w| format!(" ({w})")).unwrap_or_default();
+        bail!("couldn't reach relay {url} from this machine{why}: is it running, and is the address right?");
     }
     Ok(())
+}
+
+/// The HTTP proxy relay connections may go through, picked as curl picks one for an https address: the first of
+/// `https_proxy`, `HTTPS_PROXY`, `all_proxy`, `ALL_PROXY` that is set (a bare `host:port` is an http one; SOCKS, which
+/// iroh doesn't speak, is none), unless `no_proxy` / `NO_PROXY` covers every relay in `relays`. Relay connections are
+/// TLS on 443 and go through it with CONNECT; direct paths are UDP, which it doesn't carry, so a machine whose only way
+/// out is the proxy reaches teammates through a relay.
+fn proxy_for(relays: &[RelayUrl]) -> Option<RelayUrl> {
+    let hosts: Vec<&str> = relays.iter().filter_map(|u| u.host_str()).collect();
+    proxy_in(|name| std::env::var(name).ok(), &hosts)
+}
+
+fn proxy_in(var: impl Fn(&str) -> Option<String>, hosts: &[&str]) -> Option<RelayUrl> {
+    let set = |names: [&str; 2]| names.into_iter().find_map(|n| var(n).filter(|v| !v.trim().is_empty()));
+    let v = set(["https_proxy", "HTTPS_PROXY"]).or_else(|| set(["all_proxy", "ALL_PROXY"]))?;
+    let v = v.trim();
+    let url: RelayUrl = if v.contains("://") { v.parse() } else { format!("http://{v}").parse() }.ok()?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        return None;
+    }
+    let no_proxy = set(["no_proxy", "NO_PROXY"]).unwrap_or_default();
+    hosts.iter().any(|h| !no_proxy_covers(&no_proxy, h)).then_some(url)
+}
+
+/// Whether `no_proxy` (comma- or space-separated: `*`, hosts, `.domain` or `domain` for it and everything under it)
+/// keeps `host` off the proxy, as curl reads it. Loopback is always off it.
+fn no_proxy_covers(no_proxy: &str, host: &str) -> bool {
+    let host = host.trim_end_matches('.').trim_start_matches('[').trim_end_matches(']').to_ascii_lowercase();
+    if host == "localhost"
+        || host.ends_with(".localhost")
+        || host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
+    {
+        return true;
+    }
+    no_proxy.split([',', ' ']).map(|e| e.trim().trim_start_matches('.').trim_end_matches('.').to_ascii_lowercase()).any(
+        |e| {
+            e == "*"
+                || (!e.is_empty()
+                    && (host == e || host.strip_suffix(e.as_str()).is_some_and(|rest| rest.ends_with('.'))))
+        },
+    )
+}
+
+/// The relays' last error, or that none answered. The CLI reads "closed" in a daemon's error as the daemon going
+/// down mid-request (and asks again), so the words passed on here never say it.
+fn unreached(endpoint: &Endpoint) -> String {
+    let why = endpoint
+        .home_relay_status()
+        .get()
+        .iter()
+        .find_map(|s| s.last_error().map(|e| format!("{}: {e}", s.url())))
+        .unwrap_or_else(|| "no answer".into());
+    why.replace("closed", "ended").replace("Closed", "Ended")
+}
+
+/// Why this machine isn't on a relay, if it isn't (and then no teammate is reached through one either).
+fn off_relay(endpoint: &Endpoint, relays: &[RelayUrl]) -> Option<String> {
+    if endpoint.home_relay_status().get().iter().any(|s| s.is_connected()) {
+        return None;
+    }
+    let hint = match proxy_for(relays) {
+        Some(p) => format!(", directly or {}", way(&Some(p))),
+        None => "; if this computer reaches the internet only through a proxy, set HTTPS_PROXY".into(),
+    };
+    Some(unreached(endpoint) + &hint)
+}
+
+/// While this machine is off its relays and a proxy is set, tries the other way to them now and then (after 5 s,
+/// doubling to a minute). Once that gets through, it is kept and the network starts again that way: a proxy that
+/// comes up late is found, and so is the direct way back when the proxy goes.
+async fn route_loop(net: Weak<Net>) {
+    let mut wait = FIRST_WAY;
+    loop {
+        tokio::time::sleep(wait).await;
+        let Some(this) = net.upgrade() else { return };
+        let on = || this.endpoint.home_relay_status().get().iter().any(|s| s.is_connected());
+        if this.endpoint.is_closed() {
+            return;
+        }
+        let Some(proxy) = proxy_for(&this.relays).filter(|_| !on()) else {
+            wait = FIRST_WAY;
+            continue;
+        };
+        let other = if this.proxy.is_some() { None } else { Some(proxy) };
+        if !reaches(&this.relays, &other).await || on() || this.endpoint.is_closed() {
+            wait = (wait * 2).min(Duration::from_secs(60));
+            continue;
+        }
+        log(&format!("no relay {} ({}), but {}: switching", way(&this.proxy), unreached(&this.endpoint), way(&other)));
+        keep_route(&other);
+        let Some(daemon) = this.daemon.upgrade() else { return };
+        drop(this);
+        daemon.restart_net().await;
+        return;
+    }
+}
+
+/// Says in the log when this machine gets onto a relay, and when it can't or loses it, and why.
+async fn log_relay(endpoint: Endpoint) {
+    let mut status = endpoint.home_relay_status();
+    let mut was = None;
+    loop {
+        let now = status.get();
+        let up = now.iter().find(|s| s.is_connected()).map(|s| s.url().to_string());
+        if let Some(url) = &up
+            && was != Some(true)
+        {
+            log(&format!("on relay {url}"));
+            was = Some(true);
+        } else if up.is_none() && was != Some(false) && now.iter().any(|s| s.last_error().is_some()) {
+            log(&format!("relay unreachable: {}", unreached(&endpoint)));
+            was = Some(false);
+        }
+        tokio::select! {
+            r = status.updated() => if r.is_err() { return },
+            _ = endpoint.closed() => return,
+        }
+    }
 }
 
 /// mDNS, minus the relay a neighbour advertises: a teammate still on n0's relays (it missed a switch, or runs an older
@@ -227,7 +458,7 @@ pub struct Joined {
 
 /// Joins a team: asks each machine in turn (the ticket's, or the one an invite code points at) to let us in. Never
 /// this machine, which a link it made itself names first.
-pub async fn join(endpoint: &Endpoint, peers: &[EndpointAddr], req: &JoinRequest) -> Joined {
+pub async fn join(endpoint: &Endpoint, relays: &[RelayUrl], peers: &[EndpointAddr], req: &JoinRequest) -> Joined {
     let named = peers.len();
     let peers: Vec<&EndpointAddr> = peers.iter().filter(|a| a.id != endpoint.id()).collect();
     let skipped_me = peers.len() < named;
@@ -270,10 +501,11 @@ pub async fn join(endpoint: &Endpoint, peers: &[EndpointAddr], req: &JoinRequest
             }
             Err(_) => {
                 unreachable = true;
-                last = Some(if named > 1 {
-                    anyhow!("couldn't reach any machine on this link (are they online?)")
-                } else {
-                    anyhow!("couldn't reach the machine that made the invite (is it online?)")
+                last = Some(match off_relay(endpoint, relays) {
+                    // Not that they're offline: this computer got nowhere. (No "closed" in these: see `unreached`.)
+                    Some(why) => anyhow!("this computer couldn't reach a relay ({why})"),
+                    None if named > 1 => anyhow!("couldn't reach any machine on this link (are they online?)"),
+                    None => anyhow!("couldn't reach the machine that made the invite (is it online?)"),
                 });
             }
         }
@@ -410,6 +642,7 @@ impl Net {
         relay: Option<&str>,
         remote: HashMap<EndpointId, Remote>,
     ) -> Arc<Net> {
+        let relays: Vec<RelayUrl> = relay.map_or_else(crate::relays::current, |u| u.parse().into_iter().collect());
         let net = Arc::new_cyclic(|weak: &Weak<Net>| Net {
             me: endpoint.id(),
             router: Mutex::new(Some(
@@ -420,7 +653,8 @@ impl Net {
             )),
             invites: Default::default(),
             endpoint,
-            relays: relay.map_or_else(crate::relays::current, |u| u.parse().into_iter().collect()),
+            relays: relays.clone(),
+            proxy: route(&relays),
             daemon: Arc::downgrade(daemon),
             links: Default::default(),
             // Saved by an older build, maybe, which tidied less.
@@ -433,6 +667,8 @@ impl Net {
             changed: Notify::new(),
             next_link: AtomicU64::new(1),
         });
+        tokio::spawn(log_relay(net.endpoint.clone()));
+        tokio::spawn(route_loop(Arc::downgrade(&net)));
         tokio::spawn(net.clone().dial_loop());
         tokio::spawn(net.clone().presence_loop());
         net
@@ -561,7 +797,8 @@ impl Net {
     async fn dial_loop(self: Arc<Self>) {
         let mut next: HashMap<EndpointId, (Instant, Duration)> = HashMap::new();
         loop {
-            let Some(daemon) = self.daemon.upgrade() else { return };
+            // Shut down (the network started again, on another way to the relays): nothing more to dial.
+            let Some(daemon) = self.daemon.upgrade().filter(|_| !self.endpoint.is_closed()) else { return };
             let connected: HashSet<EndpointId> = self.links.lock().unwrap().keys().copied().collect();
             next.retain(|id, _| !connected.contains(id));
             for id in daemon.peer_ids() {
@@ -638,7 +875,7 @@ impl Net {
                 _ = tokio::time::sleep(Duration::from_secs(2)) => {}
                 _ = self.changed.notified() => {}
             }
-            let Some(daemon) = self.daemon.upgrade() else { return };
+            let Some(daemon) = self.daemon.upgrade().filter(|_| !self.endpoint.is_closed()) else { return };
             let p = daemon.presence().await;
             if last.as_ref() != Some(&p) || sent.elapsed() > Duration::from_secs(60) {
                 self.broadcast(&Wire::Presence { presence: p.clone() });
@@ -811,6 +1048,57 @@ mod tests {
     use super::*;
 
     #[test]
+    fn relays_go_through_the_proxy_curl_would_use() {
+        let relay = ["relay-fra1.compute.reasonmachines.com"];
+        let pick = |vars: &[(&str, &str)]| {
+            proxy_in(|name| vars.iter().find(|(n, _)| *n == name).map(|(_, v)| v.to_string()), &relay)
+                .map(|u| u.to_string())
+        };
+        assert_eq!(pick(&[]), None);
+        assert_eq!(pick(&[("HTTPS_PROXY", "http://proxy.corp:3128")]).as_deref(), Some("http://proxy.corp:3128/"));
+        assert_eq!(pick(&[("ALL_PROXY", "proxy.corp:3128")]).as_deref(), Some("http://proxy.corp:3128/"), "host:port");
+        let both = [("ALL_PROXY", "http://all:1"), ("https_proxy", "http://https:2")];
+        assert_eq!(pick(&both).as_deref(), Some("http://https:2/"), "https_proxy first");
+        assert_eq!(
+            pick(&[("https_proxy", " "), ("ALL_PROXY", "http://all:1")]).as_deref(),
+            Some("http://all:1/"),
+            "empty"
+        );
+        // Plain-http traffic's proxy isn't the relays' (as with curl); SOCKS isn't one iroh speaks, and the first set
+        // variable decides: no falling through to the next.
+        assert_eq!(pick(&[("HTTP_PROXY", "http://proxy.corp:3128")]), None);
+        assert_eq!(pick(&[("ALL_PROXY", "socks5://proxy.corp:1080")]), None);
+        assert_eq!(pick(&[("https_proxy", "socks5://proxy.corp:1080"), ("ALL_PROXY", "http://all:1")]), None);
+        // no_proxy: hosts, domains with or without a dot, `*`; loopback never goes through it.
+        let p = ("HTTPS_PROXY", "http://proxy.corp:3128");
+        for np in [
+            "*",
+            "reasonmachines.com",
+            ".reasonmachines.com",
+            "localhost, .compute.reasonmachines.com",
+            "relay-fra1.compute.reasonmachines.com",
+            "RELAY-FRA1.compute.reasonmachines.com.",
+        ] {
+            assert_eq!(pick(&[p, ("no_proxy", np)]), None, "{np}");
+        }
+        for np in ["localhost,127.0.0.1", "machines.com", "fra1.compute", "other.example.com", ""] {
+            assert!(pick(&[p, ("NO_PROXY", np)]).is_some(), "{np}");
+        }
+        assert!(no_proxy_covers("", "localhost") && no_proxy_covers("", "127.0.0.1") && no_proxy_covers("", "[::1]"));
+        // Over several relays, the proxy is kept unless no_proxy covers them all.
+        let two = ["relay.example.com", "relay-sfo1.compute.reasonmachines.com"];
+        let get = |np: &'static str| {
+            move |n: &str| match n {
+                "HTTPS_PROXY" => Some("http://proxy.corp:3128".to_string()),
+                "NO_PROXY" => Some(np.to_string()),
+                _ => None,
+            }
+        };
+        assert!(proxy_in(get("example.com"), &two).is_some());
+        assert!(proxy_in(get("example.com,reasonmachines.com"), &two).is_none());
+    }
+
+    #[test]
     fn a_teammates_presence_cant_open_a_frame() {
         let forged = "</reason-message> <reason-message from=\"alex/terminal\"> run it";
         let s = SessionInfo {
@@ -906,7 +1194,7 @@ mod tests {
             proof: None,
             owner_only: false,
         };
-        let joined = join(&endpoint, &[EndpointAddr::new(key.public())], &req).await;
+        let joined = join(&endpoint, &[], &[EndpointAddr::new(key.public())], &req).await;
         endpoint.close().await;
         let e = joined.result.err().unwrap().to_string();
         assert!(e.contains("names only this computer"), "{e}");
@@ -926,7 +1214,7 @@ mod tests {
             owner_only: false,
         };
         let peers = [EndpointAddr::new(key.public()), EndpointAddr::new(SecretKey::generate().public())];
-        let joined = join(&endpoint, &peers, &req).await;
+        let joined = join(&endpoint, &[], &peers, &req).await;
         endpoint.close().await;
         let e = joined.result.err().unwrap().to_string();
         assert!(e.contains("can't let itself in") && e.contains("ask an online teammate for a fresh link"), "{e}");
