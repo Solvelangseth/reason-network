@@ -116,6 +116,8 @@ pub struct Daemon {
     asks: Mutex<HashMap<String, ask::Asking>>,
     /// When this daemon started: sessions live before it register again in the while after.
     started: Instant,
+    /// Until when Reason sessions are listed without `--fields`, which the installed `reason` refused.
+    plain_until: Mutex<Option<Instant>>,
 }
 
 struct Inner {
@@ -208,6 +210,7 @@ impl Daemon {
             shown: Mutex::new(HashMap::new()),
             asks: Mutex::new(HashMap::new()),
             started: Instant::now(),
+            plain_until: Mutex::new(None),
         })
     }
 

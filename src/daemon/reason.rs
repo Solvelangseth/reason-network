@@ -11,7 +11,7 @@ use anyhow::{Result, bail};
 use serde_json::Value;
 use std::{
     collections::HashSet,
-    sync::{Arc, Mutex},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -19,10 +19,9 @@ const EVERY: Duration = Duration::from_secs(15);
 /// What the loop reads of each session. With only these, Reason answers "unchanged" (the CLI keeps the last page)
 /// until one of them changes, instead of sending every session's prompt and usage every 15 s.
 const FIELDS: &str = "title,repo,branch,status,finished_at,is_archived";
-/// A CLI from before `--fields` refuses it; the plain list is read for this long before trying again (the CLI
-/// updates itself).
+/// When the narrow list fails and the plain one works (a CLI from before `--fields`, a server that refuses one of
+/// them), the plain list is read for this long before trying again (the CLI updates itself).
 const PLAIN_FOR: Duration = Duration::from_secs(3600);
-static PLAIN_UNTIL: Mutex<Option<Instant>> = Mutex::new(None);
 /// The relay is started again this long after it stops, doubling up to `RELAY_MAX_WAIT` while it keeps stopping.
 const RELAY_WAIT: Duration = Duration::from_secs(30);
 const RELAY_MAX_WAIT: Duration = Duration::from_secs(600);
@@ -89,12 +88,25 @@ impl Daemon {
 
     async fn reason_sync(self: &Arc<Self>) -> Result<()> {
         let Some(bin) = agent::find_bin("reason") else { return Ok(()) };
-        let narrow = PLAIN_UNTIL.lock().unwrap().is_none_or(|until| Instant::now() >= until);
-        let mut out = list_sessions(&bin, narrow).await?;
-        if narrow && !out.status.success() && String::from_utf8_lossy(&out.stderr).contains("--fields") {
-            *PLAIN_UNTIL.lock().unwrap() = Some(Instant::now() + PLAIN_FOR);
-            out = list_sessions(&bin, false).await?;
-        }
+        self.sync_from(&bin).await
+    }
+
+    async fn sync_from(self: &Arc<Self>, bin: &std::path::Path) -> Result<()> {
+        let narrow = self.plain_until.lock().unwrap().is_none_or(|until| Instant::now() >= until);
+        let narrowed =
+            if narrow { list_sessions(bin, true).await.ok().filter(|out| out.status.success()) } else { None };
+        let out = match narrowed {
+            Some(out) => out,
+            None => {
+                let out = list_sessions(bin, false).await?;
+                // Whatever the narrow list failed on, the plain one works: read it for a while. When both fail
+                // (signed out, offline), the next time tries narrow again.
+                if narrow && out.status.success() {
+                    *self.plain_until.lock().unwrap() = Some(Instant::now() + PLAIN_FOR);
+                }
+                out
+            }
+        };
         if !out.status.success() {
             bail!("{}", String::from_utf8_lossy(&out.stderr).trim());
         }
@@ -179,4 +191,79 @@ async fn list_sessions(bin: &std::path::Path, narrow: bool) -> Result<std::proce
 
 fn first_words(title: &str) -> String {
     util::slug(&title.split_whitespace().take(3).collect::<Vec<_>>().join(" "))
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    /// A stub `reason` whose `session list --fields …` fails with `narrow_err`, and whose plain list prints one live
+    /// session, or fails with `plain_err`. Each call's arguments go to `calls`. Its folder goes when it does.
+    struct Stub {
+        dir: PathBuf,
+        bin: PathBuf,
+        calls: PathBuf,
+    }
+
+    impl Stub {
+        fn new(narrow_err: &str, plain_err: Option<&str>) -> Stub {
+            let dir = std::env::temp_dir().join(format!("reason-network-reason-{}", ulid::Ulid::new()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let (bin, calls) = (dir.join("reason"), dir.join("calls"));
+            let plain = match plain_err {
+                Some(e) => format!("echo '{e}' >&2; exit 1"),
+                None => r#"echo '{"items":[{"session_id":"r-1","status":"running","title":"Fix flaky billing test","finished_at":null,"is_archived":false}]}'"#.into(),
+            };
+            let script = format!(
+                "#!/bin/sh\necho \"$*\" >> '{}'\ncase \" $* \" in *' --fields '*) echo '{narrow_err}' >&2; exit 1;; esac\n{plain}\n",
+                calls.display()
+            );
+            // Written by a child: a file this process has open for writing, which a test forking at that moment
+            // holds open until its exec, can't be run (ETXTBSY).
+            let written = std::process::Command::new("sh")
+                .args(["-c", "printf '%s' \"$1\" > \"$2\" && chmod 755 \"$2\"", "sh", &script])
+                .arg(&bin)
+                .status()
+                .unwrap();
+            assert!(written.success());
+            Stub { dir, bin, calls }
+        }
+
+        /// Whether each call so far asked narrow.
+        fn calls(&self) -> Vec<bool> {
+            std::fs::read_to_string(&self.calls).unwrap().lines().map(|l| l.contains("--fields")).collect()
+        }
+    }
+
+    impl Drop for Stub {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_narrow_list_that_fails_falls_back_to_the_plain_list_for_a_while() {
+        let d = Arc::new(super::super::test_daemon(Default::default()));
+        let stub = Stub::new("Reason: 400 Bad Request: fields: \"repo\" is not a property", None);
+        d.sync_from(&stub.bin).await.unwrap();
+        assert!(d.inner.lock().unwrap().live.contains_key("reason:r-1"));
+        d.sync_from(&stub.bin).await.unwrap();
+        assert_eq!(stub.calls(), [true, false, false]);
+        // Once the while is up, narrow is tried again.
+        *d.plain_until.lock().unwrap() = Some(Instant::now());
+        d.sync_from(&stub.bin).await.unwrap();
+        assert_eq!(stub.calls(), [true, false, false, true, false]);
+        assert!(d.inner.lock().unwrap().live.contains_key("reason:r-1"));
+    }
+
+    #[tokio::test]
+    async fn a_list_that_fails_either_way_is_one_error_and_tries_narrow_again() {
+        let d = Arc::new(super::super::test_daemon(Default::default()));
+        let signed_out = "Reason: Not signed in. Run reason login.";
+        let stub = Stub::new(signed_out, Some(signed_out));
+        assert_eq!(d.sync_from(&stub.bin).await.unwrap_err().to_string(), signed_out);
+        assert!(d.plain_until.lock().unwrap().is_none());
+        assert_eq!(stub.calls(), [true, false]);
+    }
 }
