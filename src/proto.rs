@@ -391,8 +391,9 @@ pub struct TeamInfo {
     /// for others. Older engines leave it out.
     #[serde(default)]
     pub features: Vec<String>,
-    /// How many messages sessions here sent, and how many reached mailboxes here, on each of the last seven days
-    /// (UTC) that had any: counts only, kept on this machine and sent nowhere. Older engines leave it out.
+    /// Per-day totals of messages sent and received on this machine, returned to local clients on the socket: sent
+    /// once the receiving machine took them, received once in a mailbox here (a held one once approved). For the days
+    /// (UTC) from six before today to tomorrow that had any. Older engines leave it out.
     #[serde(default)]
     pub messages: Vec<DayCount>,
 }

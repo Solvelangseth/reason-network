@@ -99,8 +99,8 @@ impl Daemon {
         self.inner.lock().unwrap().store.outbox_for(&id.to_string(), util::now_ms()).unwrap_or_default()
     }
 
-    pub fn outbox_done(&self, id: &str) {
-        let _ = self.inner.lock().unwrap().store.outbox_done(id);
+    pub fn outbox_done(&self, id: &str, taken: bool) {
+        let _ = self.inner.lock().unwrap().store.outbox_done(id, taken);
     }
 
     /// Takes in a teammate's copy of the team state, passing it on if it taught us something.

@@ -760,7 +760,7 @@ impl Net {
             Wire::Ack { id, state, note } => {
                 // "retry": the other side is busy; keep it in the outbox for the next flush.
                 if state != "retry" {
-                    daemon.outbox_done(&id);
+                    daemon.outbox_done(&id, state != "refused");
                 }
                 if let Some(waiter) = self.acks.lock().unwrap().remove(&id) {
                     let _ = waiter.send((state, note));

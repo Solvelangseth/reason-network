@@ -29,15 +29,20 @@ struct Kept {
     files: Vec<Attachment>,
 }
 
-/// What [`Store::count`] counts: a message a session here sent, or one that reached a mailbox here.
+/// What [`Store::count`] counts: a message a session here sent, once the receiving machine took it, or one that reached
+/// a mailbox here (counted by whoever stores it, or once approved if it was held).
 #[derive(Clone, Copy)]
 pub enum Counted {
     Sent,
     Received,
 }
 
-/// Message counts are kept for today and the six days before it (an SQLite date modifier).
-const COUNTS_SINCE: &str = "-6 days";
+/// The days whose message counts are shown: today, the six before it, and tomorrow (SQLite date modifiers).
+const COUNTS_FROM: &str = "-6 days";
+const COUNTS_TO: &str = "+1 day";
+/// Days of counts kept: the last ones started, in the order they started rather than by date, so a clock that jumps
+/// doesn't push out the real ones.
+const COUNTS_KEPT: i64 = 8;
 
 /// A held message that can't be approved now, and why (it stays held).
 pub type Unsaved = (String, String);
@@ -320,6 +325,7 @@ impl Store {
                 }
                 return Err(e.into());
             }
+            let _ = self.count(crate::util::now_ms(), Counted::Received);
             done.push(m);
         }
         Ok((done, unsaved))
@@ -341,12 +347,16 @@ impl Store {
         Ok(rows.filter_map(|r| r.ok().and_then(|s| serde_json::from_str(&s).ok())).collect())
     }
 
-    pub fn outbox_done(&self, id: &str) -> Result<()> {
-        self.db.execute("DELETE FROM outbox WHERE id = ?1", [id])?;
+    /// The receiving machine answered for a message: it leaves the outbox, and counts as sent if that machine took it
+    /// (once, however many answers come).
+    pub fn outbox_done(&self, id: &str, taken: bool) -> Result<()> {
+        if self.db.execute("DELETE FROM outbox WHERE id = ?1", [id])? == 1 && taken {
+            let _ = self.count(crate::util::now_ms(), Counted::Sent);
+        }
         Ok(())
     }
 
-    /// Adds one to today's count (by UTC day). Only numbers are kept, and only for a week.
+    /// Adds one to today's count (by UTC day). Only numbers are kept, and only for the last few days.
     pub fn count(&self, now: i64, what: Counted) -> Result<()> {
         let col = match what {
             Counted::Sent => "sent",
@@ -359,17 +369,20 @@ impl Store {
             ),
             [now],
         )?;
-        self.db
-            .execute("DELETE FROM counts WHERE day < date(?1 / 1000, 'unixepoch', ?2)", params![now, COUNTS_SINCE])?;
+        self.db.execute(
+            "DELETE FROM counts WHERE rowid NOT IN (SELECT rowid FROM counts ORDER BY rowid DESC LIMIT ?1)",
+            [COUNTS_KEPT],
+        )?;
         Ok(())
     }
 
-    /// The days kept that had messages, oldest first.
+    /// The days shown that had messages, oldest first.
     pub fn counts(&self, now: i64) -> Result<Vec<DayCount>> {
         let mut st = self.db.prepare_cached(
-            "SELECT day, sent, received FROM counts WHERE day >= date(?1 / 1000, 'unixepoch', ?2) ORDER BY day",
+            "SELECT day, sent, received FROM counts
+             WHERE day BETWEEN date(?1 / 1000, 'unixepoch', ?2) AND date(?1 / 1000, 'unixepoch', ?3) ORDER BY day",
         )?;
-        let rows = st.query_map(params![now, COUNTS_SINCE], |r| {
+        let rows = st.query_map(params![now, COUNTS_FROM, COUNTS_TO], |r| {
             Ok(DayCount { day: r.get(0)?, sent: r.get(1)?, received: r.get(2)? })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -589,6 +602,62 @@ mod tests {
         );
         drop(store);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn counts_are_shown_to_tomorrow_and_a_clock_that_jumps_loses_no_real_days() {
+        let store = Store::open(Path::new(":memory:"), temp_inbox()).unwrap();
+        let day = 86_400_000;
+        let oct20 = 1_792_454_400_000; // 2026-10-20T00:00:00Z
+        let count = |day: &str, sent| DayCount { day: day.into(), sent, received: 0 };
+        for at in [oct20 - 6 * day, oct20, oct20 + day, oct20 + 2 * day] {
+            store.count(at, Counted::Sent).unwrap();
+        }
+        let week = [count("2026-10-14", 1), count("2026-10-20", 1), count("2026-10-21", 1)];
+        assert_eq!(store.counts(oct20).unwrap(), week, "not the day after tomorrow");
+        // The clock is a year ahead for a while, then right again.
+        store.count(oct20 + 365 * day, Counted::Sent).unwrap();
+        assert_eq!(store.counts(oct20).unwrap(), week);
+        assert_eq!(store.counts(oct20 + 365 * day).unwrap(), [count("2027-10-20", 1)]);
+        // Only the last days begun are kept.
+        for i in 3..20 {
+            store.count(oct20 + i * day, Counted::Sent).unwrap();
+        }
+        let kept: i64 = store.db.query_row("SELECT COUNT(*) FROM counts", [], |r| r.get(0)).unwrap();
+        assert_eq!(kept, COUNTS_KEPT);
+        assert_eq!(store.counts(oct20 + 19 * day).unwrap().len(), 7);
+    }
+
+    #[test]
+    fn a_message_counts_as_sent_once_taken_and_as_received_once_in_a_mailbox() {
+        let inbox = temp_inbox();
+        let store = Store::open(Path::new(":memory:"), inbox.clone()).unwrap();
+        let totals = |store: &Store| {
+            let days = store.counts(util::now_ms()).unwrap();
+            (days.iter().map(|d| d.sent).sum::<u64>(), days.iter().map(|d| d.received).sum::<u64>())
+        };
+        // Sent: once the other machine takes it (answered twice, after a lost answer), not when it refuses it or it
+        // expires in the outbox.
+        for id in ["01TAKEN", "01REFUSED", "01EXPIRED"] {
+            store.outbox_add("peer", &with_files(id, "sven/api")).unwrap();
+        }
+        store.outbox_done("01TAKEN", true).unwrap();
+        store.outbox_done("01TAKEN", true).unwrap();
+        store.outbox_done("01REFUSED", false).unwrap();
+        assert!(store.outbox_for("peer", util::now_ms() + 8 * 86_400_000).unwrap().is_empty());
+        assert_eq!(totals(&store), (1, 0));
+        // Received: held, it counts once approved. Dropped, then sent again after a lost answer, it counts once.
+        store.insert(&mut with_files("01HELD", "lars/api"), true).unwrap();
+        store.settle_held(&["01HELD".into()], false).unwrap();
+        store.insert(&mut with_files("01HELD", "lars/api"), true).unwrap();
+        assert_eq!(totals(&store), (1, 0));
+        store.settle_held(&["01HELD".into()], true).unwrap();
+        assert!(!store.insert(&mut with_files("01HELD", "lars/api"), true).unwrap());
+        assert_eq!(totals(&store), (1, 1));
+        // Storing one that isn't held counts nothing: the caller counts it if it is a message.
+        store.insert(&mut with_files("01NEW", "lars/api"), false).unwrap();
+        assert_eq!(totals(&store), (1, 1));
+        std::fs::remove_dir_all(&inbox).unwrap();
     }
 
     #[test]
