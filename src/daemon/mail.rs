@@ -5,7 +5,16 @@
 //! don't show them a second time.
 
 use super::{Daemon, Inner, directory::Target, log};
-use crate::{agent, claude, config::Policy, files, proto::*, render, store::Counted, team::Signed, util};
+use crate::{
+    agent, claude,
+    config::Policy,
+    files,
+    proto::*,
+    render,
+    store::{Counted, Remembered},
+    team::Signed,
+    util,
+};
 use anyhow::{Result, anyhow, bail};
 use iroh::EndpointId;
 use std::{
@@ -75,20 +84,23 @@ const LOOP_NOTE: &str = "refused: these two agents have exchanged a lot of messa
                          looks like a loop. Check with your user before continuing.";
 
 /// The note for mail queued for a session that is offline. Its unread mail is deleted at the first cleanup a day after
-/// it was last seen, unless it is one of the person's own mailboxes (`cli`), which are kept. Until then, a new session
-/// that takes the name gets the mail.
-fn offline_note(r: Option<&crate::store::Remembered>, now: i64) -> String {
+/// it was last seen, unless it is one of the person's own mailboxes (`cli`), which are kept. Until then it waits for
+/// that session, when the session can come back to its name (see [`Remembered::kept`]); else a new session that takes
+/// the name gets it.
+fn offline_note(r: Option<&Remembered>, now: i64) -> String {
     const NAME: &str = "a new session that takes this name gets the mail";
+    const BACK: &str = "it reaches that session when it's back";
     let Some(r) = r else { return format!("queued: the session is offline; {NAME}") };
+    let who = if r.kept() { BACK } else { NAME };
     let seen = util::ago(r.last_seen, now);
     let forgotten = r.last_seen.saturating_add(super::sessions::FORGET_MS);
     if r.agent == "cli" {
-        format!("queued: last seen {seen} ago; {NAME}")
+        format!("queued: last seen {seen} ago; {who}")
     } else if forgotten <= now {
-        format!("queued: last seen {seen} ago; unread mail may be dropped any time; {NAME}")
+        format!("queued: last seen {seen} ago; unread mail may be dropped any time; {who}")
     } else {
         let left = util::ago(now, forgotten);
-        format!("queued: last seen {seen} ago; unread mail is dropped after about {left} if it stays offline; {NAME}")
+        format!("queued: last seen {seen} ago; unread mail is dropped after about {left} if it stays offline; {who}")
     }
 }
 
@@ -141,6 +153,8 @@ impl Daemon {
             let (from_addr, from_agent, from_repo) =
                 (self.addr(&sender.name), Some(sender.reg.agent.clone()), sender.git.repo.clone());
             let exclude = sender.reg.key.clone();
+            // It talks to teammates: its name stays its own.
+            self.reached(&mut g, &exclude);
             // A person at a terminal may message a group; an agent picks the one session it needs.
             if is_group(to) && !from_addr.ends_with("/terminal") {
                 bail!("agents message one session, not a group: pick it with list_team, or ask your user");
@@ -293,10 +307,13 @@ impl Daemon {
         msgs: Vec<Message>,
         wake: bool,
     ) -> (String, String) {
-        let Some(l) = g.live.get(key) else {
+        if !g.live.contains_key(key) {
             let note = offline_note(g.store.session_by_key(key).ok().flatten().as_ref(), util::now_ms());
             return ("queued".into(), note);
-        };
+        }
+        // Mail reached it: it is a session teammates talk to, whose name stays its own.
+        self.reached(g, key);
+        let l = &g.live[key];
         if !wake {
             return ("queued".into(), "queued as FYI: it reads it at its next natural pause".into());
         }
@@ -475,9 +492,9 @@ impl Daemon {
     /// A message from a teammate's machine. Returns the state and a note for the sender. A `retry` state
     /// means "not now": the sender keeps it in its outbox.
     pub fn receive(self: &Arc<Self>, peer: EndpointId, msg: Message) -> Result<(String, String)> {
-        let sender = self
+        let (sender, machine) = self
             .team_state()
-            .and_then(|t| t.member(&peer).map(|m| m.person.clone()))
+            .and_then(|t| t.member(&peer).map(|m| (m.person.clone(), m.machine.clone())))
             .ok_or_else(|| anyhow!("not a team member"))?;
         let mut msg = clean(msg)?;
         // Messages go between agent sessions (or, with notify, to a person's screen); an older Reason Network may still send
@@ -548,13 +565,23 @@ impl Daemon {
                 let note = format!("refused: agents message one of {}'s sessions, not a group", self.person);
                 return Ok(("refused".into(), note));
             }
+            // Each machine has its own terminal: replies go back to the one this came from.
+            if render::from_terminal(&msg.from) {
+                msg.from = format!("{}@{machine}", msg.from);
+            }
             // A held message's files are saved only once the person approves it.
             let held = policy == Policy::Hold;
+            // Held for a session whose name is kept, it is that session's: it goes when the session does.
+            let kept = held && g.store.session_by_name(name)?.is_some_and(|r| r.kept());
             // Counted once, when it is new here; a held one once approved.
             if g.store.insert(&mut msg, held)? && !held {
                 let _ = g.store.count(util::now_ms(), Counted::Received);
             }
             let (state, note) = match key {
+                _ if kept => (
+                    "held".into(),
+                    format!("held until {} approves it; dropped if that session is gone for a day first", self.person),
+                ),
                 _ if held => ("held".into(), format!("held until {} approves it", self.person)),
                 Some(key) => self.deliver(&mut g, &key, vec![msg.clone()], msg.wake),
                 None => ("queued".into(), offline_note(remembered.as_ref(), util::now_ms())),
@@ -564,7 +591,7 @@ impl Daemon {
         self.arrived.notify_waiters();
         // The sender's session can be answered right away, before its machine's next presence names it.
         if let (Some(net), Some((_, from))) = (self.net(), msg.from.split_once('/')) {
-            net.note_session(&peer, from);
+            net.note_session(&peer, from.split_once('@').map_or(from, |(n, _)| n));
         }
         Ok(res)
     }
@@ -680,7 +707,7 @@ fn tidy(s: &str, extra: &str, max: usize) -> Option<String> {
 /// Whether an approval that came from `peer` (a machine of `sender`'s) to the session `to` stands: signed by that machine
 /// for this team, as its own person's answer, for that session, and of a sane size (in characters, as the sender cuts
 /// it). Which request it answers is the approver's machine's word: the frame shows `about`, for the agent to check.
-fn approval_holds(a: &Signed<Approval>, team: &str, peer: &EndpointId, sender: &str, to: &str) -> bool {
+pub(super) fn approval_holds(a: &Signed<Approval>, team: &str, peer: &EndpointId, sender: &str, to: &str) -> bool {
     let b = &a.body;
     let size: usize = [&b.about, &b.asker, &b.question, &b.request, &b.note].iter().map(|s| s.chars().count()).sum();
     size <= 2000 && a.by == *peer && b.approver == sender && b.asker == to && a.verify(team, "approval")
@@ -788,9 +815,9 @@ mod tests {
 
     #[test]
     fn queued_mail_says_when_it_may_be_dropped_and_who_gets_it() {
-        let seen = |agent: &str| crate::store::Remembered {
+        let seen = |key: &str, agent: &str| Remembered {
             name: "api-codex".into(),
-            key: "codex:1".into(),
+            key: key.into(),
             agent: agent.into(),
             cwd: "/work/api".into(),
             repo: None,
@@ -798,18 +825,26 @@ mod tests {
             doing: None,
             tier: Tier::Pull,
             last_seen: 0,
+            attached: true,
         };
-        let name = "a new session that takes this name gets the mail";
+        // A conversation its agent gave an id waits for it, whoever takes the name meanwhile.
+        let back = "it reaches that session when it's back";
         assert_eq!(
-            offline_note(Some(&seen("codex")), 3 * HOUR),
-            format!("queued: last seen 3h ago; unread mail is dropped after about 21h if it stays offline; {name}")
+            offline_note(Some(&seen("codex:1", "codex")), 3 * HOUR),
+            format!("queued: last seen 3h ago; unread mail is dropped after about 21h if it stays offline; {back}")
         );
         assert_eq!(
-            offline_note(Some(&seen("codex")), 24 * HOUR),
-            format!("queued: last seen 1d ago; unread mail may be dropped any time; {name}")
+            offline_note(Some(&seen("codex:1", "codex")), 24 * HOUR),
+            format!("queued: last seen 1d ago; unread mail may be dropped any time; {back}")
         );
         // The person's own mailboxes are never forgotten.
-        assert_eq!(offline_note(Some(&seen("cli")), 30 * HOUR), format!("queued: last seen 1d ago; {name}"));
+        assert_eq!(offline_note(Some(&seen("cli:t", "cli")), 30 * HOUR), format!("queued: last seen 1d ago; {back}"));
+        // A session known only by its process can't come back: a new one in its place gets the mail.
+        let name = "a new session that takes this name gets the mail";
+        assert_eq!(
+            offline_note(Some(&seen("proc:7", "zed")), 3 * HOUR),
+            format!("queued: last seen 3h ago; unread mail is dropped after about 21h if it stays offline; {name}")
+        );
         assert_eq!(offline_note(None, 0), format!("queued: the session is offline; {name}"));
     }
 
@@ -853,7 +888,41 @@ mod tests {
         let (state, note) = d.receive(bob.public(), msg).unwrap();
         assert_eq!(state, "queued");
         assert!(note.starts_with("queued: last seen 3h ago; unread mail is dropped after about 2"), "{note}");
-        assert!(note.ends_with("; a new session that takes this name gets the mail"), "{note}");
+        assert!(note.ends_with("; it reaches that session when it's back"), "{note}");
+    }
+
+    #[test]
+    fn a_message_from_a_teammates_terminal_is_answered_on_that_machine() {
+        let cfg = crate::config::Config { person: Some("alex".into()), ..Default::default() };
+        let d = Arc::new(super::super::test_daemon(cfg));
+        let bob = SecretKey::generate();
+        let mut team = TeamState::found("acme", &d.person, &d.machine, &d.key);
+        team.put_member(&d.key, bob.public(), "bob", "xps", true);
+        d.inner.lock().unwrap().team = Some(team);
+        let to = d.register(Some(1), codex("codex:1"), crate::git::GitInfo::default()).unwrap().address;
+        let msg = Message {
+            id: Ulid::generate().to_string(),
+            from: "bob/terminal".into(),
+            from_agent: Some("cli".into()),
+            from_repo: None,
+            to: to.clone(),
+            via: None,
+            reply_to: None,
+            body: "hi".into(),
+            wake: true,
+            notify: false,
+            sent_at: 0,
+            approval: None,
+            files: Vec::new(),
+        };
+        d.receive(bob.public(), msg).unwrap();
+        let got = d.inner.lock().unwrap().store.unread(&to).unwrap();
+        assert_eq!(got[0].from, "bob/terminal@xps");
+        let text = render::for_agent(&got, Some("codex"), false);
+        assert!(
+            text.contains("From bob, typed in a terminal.") && text.contains("send_message to \"bob/terminal@xps\""),
+            "{text}"
+        );
     }
 
     #[test]

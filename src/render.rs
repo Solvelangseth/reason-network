@@ -238,6 +238,16 @@ pub fn send_result(r: &SendResult) -> String {
 
 /// Messages framed for an agent's context: clearly peer input, with what it needs to reply. `agent` is the
 /// recipient's agent kind, if known; `cli` when it has no Reason Network tools and replies with the CLI.
+/// Whether a message comes from a person's terminal (`<person>/terminal`, or `…@<machine>` once it is here).
+pub fn from_terminal(from: &str) -> bool {
+    without_machine(from).ends_with("/terminal")
+}
+
+/// An address without the `@<machine>` it may name.
+pub fn without_machine(address: &str) -> &str {
+    address.split_once('@').map_or(address, |(a, _)| a)
+}
+
 pub fn for_agent(msgs: &[Message], agent: Option<&str>, cli: bool) -> String {
     let mut out = String::new();
     for m in msgs {
@@ -269,7 +279,7 @@ pub fn for_agent(msgs: &[Message], agent: Option<&str>, cli: bool) -> String {
     let Some(last) = msgs.last() else { return out };
     // Every message comes from an agent session (`person/session`).
     let person = last.from.split_once('/').map_or(last.from.as_str(), |(p, _)| p);
-    let who = if last.from.ends_with("/terminal") {
+    let who = if from_terminal(&last.from) {
         format!("From {person}, typed in a terminal.")
     } else {
         format!("From {person}'s agent.")
