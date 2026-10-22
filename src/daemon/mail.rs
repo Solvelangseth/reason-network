@@ -332,6 +332,12 @@ impl Daemon {
             (Tier::Push, Some(conn), _) if l.reg.agent == agent::CLAUDE_CODE && l.mcp_push => {
                 Channel::ClaudeSocket(conn)
             }
+            _ if l.reg.agent == "codex"
+                && l.last_hook.is_some()
+                && l.status.as_ref().is_some_and(|(s, _)| s == "busy") =>
+            {
+                Channel::Hook
+            }
             (Tier::Push, _, Some(id)) if l.reg.agent == "codex" && has("codex") => {
                 Channel::Command("codex", vec!["queue".into(), "--thread".into(), id.clone(), "--message".into()])
             }
