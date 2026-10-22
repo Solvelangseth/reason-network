@@ -17,7 +17,7 @@ use std::{collections::HashSet, sync::Arc, time::Instant};
 /// A hook-only session that hasn't fired a hook for this long is considered gone.
 const HOOK_TTL_MS: i64 = 6 * 3_600_000;
 /// A session gone this long isn't coming back: it is forgotten, with the mail it never read.
-const FORGET_MS: i64 = 24 * 3_600_000;
+pub(super) const FORGET_MS: i64 = 24 * 3_600_000;
 /// A session in a folder that is off counts as mid-turn this long after its last prompt or tool call.
 const OFF_TURN_MS: i64 = 10 * 60_000;
 
