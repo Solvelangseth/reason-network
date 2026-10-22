@@ -254,6 +254,66 @@ got_back = json.dumps(reply(cx, 4))
 check("…and the message is there at the next check_inbox", "after the wait was cancelled" in got_back, got_back)
 cx.kill()
 
+# Claude Code's `/clear`: the same process (and MCP server) goes on in a new conversation, which its registry names; the
+# variable the server started with still names the old one.
+clear_dir = os.path.join(D, "clear-proj")
+os.makedirs(clear_dir)
+claude_proc = subprocess.Popen(["sleep", "120"])
+entry = os.path.join(CLAUDE, "sessions", f"{claude_proc.pid}.json")
+def in_conversation(sid):
+    with open(entry, "w") as f:
+        json.dump({"pid": claude_proc.pid, "sessionId": sid, "cwd": clear_dir, "kind": "interactive"}, f)
+in_conversation("before-clear")
+cc_env = dict(env, CLAUDE_PID=str(claude_proc.pid), CLAUDE_CODE_SESSION_ID="before-clear")
+cc = subprocess.Popen([BIN, "mcp"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=cc_env, cwd=clear_dir, text=True)
+rpc(cc, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "claude-code", "version": "1"}}})
+reply(cc, 1)
+rpc(cc, {"jsonrpc": "2.0", "method": "notifications/initialized"})
+rpc(cc, {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "list_team", "arguments": {}}})
+reply(cc, 2)
+in_conversation("after-clear")
+# Before the server makes another call (it may make none for a while), the daemon's scan of the registry finds the new
+# conversation, and ends the one before: mail for that waits for it rather than going into this window.
+until_out = ""
+for _ in range(20):
+    until_out = run("who", "clear-proj")
+    if "clear-proj-claude-2" in until_out:
+        break
+    time.sleep(0.5)
+check("after /clear, Claude Code's registry puts the new conversation on at once, and only it",
+      "clear-proj-claude-2" in until_out and until_out.count("clear-proj-claude") == 1, until_out)
+log = open(os.path.join(env["REASON_NETWORK_HOME"], "daemon.log")).read()
+check("…ending the cleared one", "alex/clear-proj-claude ended: its agent went on to another conversation" in log, log[-1500:])
+out = run("send", "clear-proj-claude", "for the cleared conversation")
+check("…whose mail waits for it", "queued" in out and "it reaches that session when it's back" in out, out)
+rpc(cc, {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "list_team", "arguments": {}}})
+got3 = json.dumps(reply(cc, 3))
+check("its MCP server's next call is the new conversation's, without that mail", "for the cleared conversation" not in got3, got3)
+out = run("who", "clear-proj")
+check("…so one session shows for it", out.count("clear-proj-claude") == 1, out)
+# A shell Claude Code starts in the new conversation (the cleared one keeps its name, for /resume).
+shell_env = dict(cc_env, CLAUDECODE="1", CLAUDE_CODE_SESSION_ID="after-clear")
+out = subprocess.run([BIN, "status"], env=shell_env, capture_output=True, text=True, timeout=30).stdout
+check("…and a shell it starts now is that conversation", "You are alex/clear-proj-claude-2." in out, out)
+# A headless Claude run from that session's shell: no registry entry of its own, its server started in `inner`. The
+# entry above it is the other conversation's, so it is a session of its own, which the scan leaves alone.
+hc = subprocess.Popen([BIN, "mcp"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                      env=dict(cc_env, CLAUDE_CODE_SESSION_ID="inner"), cwd=clear_dir, text=True)
+rpc(hc, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "claude-code", "version": "1"}}})
+reply(hc, 1)
+rpc(hc, {"jsonrpc": "2.0", "method": "notifications/initialized"})
+rpc(hc, {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "list_team", "arguments": {}}})
+reply(hc, 2)
+time.sleep(5)
+out = run("who", "clear-proj")
+log = open(os.path.join(env["REASON_NETWORK_HOME"], "daemon.log")).read()
+check("a headless Claude run from it is a session of its own, not its parent's conversation",
+      "clear-proj-claude-3" in out and "clear-proj-claude-2" in out and "clear-proj-claude-3 ended" not in log
+      and "session alex/clear-proj-claude-3 registered" in log, out + log[-800:])
+hc.kill()
+cc.kill()
+claude_proc.kill()
+
 # An agent's MCP server outlives daemon restarts without collecting zombies or storming restarts.
 mcp = subprocess.Popen([BIN, "mcp"], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
 time.sleep(4)
