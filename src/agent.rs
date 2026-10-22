@@ -215,32 +215,40 @@ pub fn agent_pid() -> u32 {
 /// not have written its entry yet), not on every call: each look can run `ps` for each ancestor.
 pub fn claude_pid() -> Option<u32> {
     static PID: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    static MISSED: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
     if let Some(pid) = PID.get() {
         return Some(*pid);
     }
-    if MISSED.lock().unwrap().is_some_and(|t| t.elapsed() < LOOK_AGAIN) {
-        return None;
-    }
+    // Our ancestors don't change: they are looked up once (each can take a `ps`), their entries each time.
+    let chain = ancestors();
     let dir = paths::claude_sessions();
     let found = find_claude(
-        util::parent_pid(),
+        chain.first().copied().unwrap_or_else(util::parent_pid),
         std::env::var("CLAUDE_CODE_SESSION_ID").ok().as_deref(),
         std::env::var("CLAUDE_PID").ok().and_then(|s| s.parse().ok()),
         |p| registry_session_id(&dir, p),
-        parent_of,
+        |p| chain.iter().position(|a| *a == p).and_then(|i| chain.get(i + 1).copied()),
     );
-    match found {
-        Some(pid) => {
-            let _ = PID.set(pid);
-        }
-        None => *MISSED.lock().unwrap() = Some(std::time::Instant::now()),
+    if let Some(pid) = found {
+        let _ = PID.set(pid);
     }
     found
 }
 
-/// How long `claude_pid` goes by not having found the Claude process before it looks again.
-const LOOK_AGAIN: std::time::Duration = std::time::Duration::from_secs(30);
+/// Our parent and its ancestors, a few levels up: found once.
+fn ancestors() -> &'static [u32] {
+    static CHAIN: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
+    CHAIN.get_or_init(|| {
+        let mut chain = vec![util::parent_pid()];
+        while chain.len() < 5 {
+            let last = *chain.last().expect("never empty");
+            match parent_of(last) {
+                Some(p) if p > 1 && !chain.contains(&p) => chain.push(p),
+                _ => break,
+            }
+        }
+        chain
+    })
+}
 
 /// The Claude Code process in conversation `given`: the nearest of `start` and its ancestors, else `claude_pid`, whose
 /// registry entry (`entry`) names it. None without a conversation to match.
@@ -303,17 +311,33 @@ pub struct ClaudeSocket {
     pub token: Option<String>,
 }
 
+/// The inbox of the Claude Code session we serve: the one Claude Code gave us (`CLAUDE_CODE_MESSAGING_SOCKET`, which it
+/// sets once its inbox listens, having dropped any it inherited), else the one named by the registry entry of the
+/// process in our conversation (`claude_pid`). Never another's: a headless Claude run from another's shell has no entry,
+/// and a `CLAUDE_PID` it inherited would be the other session's. Then nothing is pushed, and mail waits for
+/// `check_inbox`.
 pub fn claude_socket() -> Option<ClaudeSocket> {
     let token = std::env::var("CLAUDE_CODE_MESSAGING_TOKEN").ok().filter(|s| !s.is_empty());
-    if let Some(path) = std::env::var_os("CLAUDE_CODE_MESSAGING_SOCKET") {
+    if let Some(path) = std::env::var_os("CLAUDE_CODE_MESSAGING_SOCKET").filter(|p| !p.is_empty()) {
         return Some(ClaudeSocket { path: path.into(), token });
     }
-    // Not exported to this process: fall back to the session's registry entry.
-    let pid = claude_pid().unwrap_or_else(agent_pid);
-    let file = paths::claude_sessions().join(format!("{pid}.json"));
-    let s: Value = serde_json::from_str(&std::fs::read_to_string(file).ok()?).ok()?;
-    let path = s["messagingSocketPath"].as_str()?;
-    Some(ClaudeSocket { path: path.into(), token: token.or_else(|| crate::claude::peer_token(pid)) })
+    let pid = claude_pid()?;
+    socket_of(&paths::claude_sessions(), pid, None, token, crate::claude::peer_token)
+}
+
+/// The inbox Claude Code process `pid`'s registry entry names, with its token: the one we were given, when that is for
+/// this very inbox, else what Claude Code keeps for its peers.
+fn socket_of(
+    dir: &Path,
+    pid: u32,
+    given: Option<PathBuf>,
+    given_token: Option<String>,
+    peer_token: impl Fn(u32) -> Option<String>,
+) -> Option<ClaudeSocket> {
+    let s: Value = serde_json::from_str(&std::fs::read_to_string(dir.join(format!("{pid}.json"))).ok()?).ok()?;
+    let path = PathBuf::from(s["messagingSocketPath"].as_str().filter(|p| !p.is_empty())?);
+    let token = given_token.filter(|_| given.as_deref() == Some(path.as_path())).or_else(|| peer_token(pid));
+    Some(ClaudeSocket { path, token })
 }
 
 pub fn post_to_claude(sock: &ClaudeSocket, text: &str) -> std::io::Result<()> {
@@ -409,6 +433,36 @@ mod tests {
         assert_eq!(find_claude(5, Some("outer"), Some(700), entry, |_| None), Some(700));
         // Nothing to match by.
         assert_eq!(find_claude(900, None, Some(700), entry, parent), None);
+    }
+
+    #[test]
+    fn a_headless_claude_pushes_nothing_into_the_session_it_was_run_from() {
+        let dir = std::env::temp_dir().join(format!("reason-network-claude-{}", ulid::Ulid::generate()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // The interactive Claude (700, in `outer`) and its inbox, which a headless Claude it runs (no entry, in
+        // `inner`) may have inherited, with CLAUDE_PID=700.
+        std::fs::write(
+            dir.join("700.json"),
+            r#"{"pid":700,"sessionId":"outer","messagingSocketPath":"/run/outer.sock"}"#,
+        )
+        .unwrap();
+        let entry = |p: u32| registry_session_id(&dir, p);
+        let parent = |p: u32| match p {
+            900 => Some(800),
+            800 => Some(700),
+            _ => None,
+        };
+        // The headless one's server finds no process of its own: no inbox, whatever it inherited.
+        assert_eq!(find_claude(900, Some("inner"), Some(700), entry, parent), None);
+        // The interactive one's server gets its own inbox, with the token it was given for it.
+        let pid = find_claude(900, Some("outer"), None, entry, parent).unwrap();
+        let none = |_| None;
+        let s = socket_of(&dir, pid, Some("/run/outer.sock".into()), Some("t".into()), none).unwrap();
+        assert_eq!((s.path, s.token.as_deref()), (PathBuf::from("/run/outer.sock"), Some("t")));
+        // A token that came with another inbox isn't this one's.
+        let s = socket_of(&dir, pid, Some("/run/other.sock".into()), Some("t".into()), none).unwrap();
+        assert_eq!(s.token, None);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

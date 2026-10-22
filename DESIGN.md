@@ -284,12 +284,19 @@ busy/idle). The daemon reads these, so Claude sessions show up with live busy/id
 MCP server loaded. Our MCP server reads the conversation it serves from there too, from the entry of the Claude Code
 process it runs under: the nearest of its ancestors, else `CLAUDE_PID`, whose entry names the conversation it was
 started in (`CLAUDE_CODE_SESSION_ID`), followed from then on. After `/clear` the same process is in a new conversation,
-which the server then serves, and the one before ends. With no such entry (a headless Claude run from an interactive
-one's shell has none, and the entry above it is the other conversation's), it goes by `CLAUDE_CODE_SESSION_ID` and
-registers no process, so nothing ends it but its own server. The daemon's scan ends it as soon as the registry names the new one, by the process the server registered
-it under, so mail for it waits for it instead of going into the new conversation before the server's next call. Any MCP
-server that serves one session at a time (not Codex's, opencode's or Cursor's) ends its session when it registers or
-takes up another, also one the registry scan or its hooks already registered.
+which the server then serves, and the one before ends: the daemon's scan ends it as soon as the registry names the new
+one, by the process the server registered it under, so mail for it waits for it instead of going into the new
+conversation before the server's next call. Any MCP server that serves one session at a time (not Codex's, opencode's
+or Cursor's) ends its session when it registers or takes up another, also one the registry scan or its hooks already
+registered. Claude Code gives each shell it starts the conversation it is in then, so a shell started before `/clear`
+keeps acting as the cleared conversation. With no such entry (a headless Claude run from an interactive one's shell has
+none, and the entry above it is the other conversation's), the server goes by `CLAUDE_CODE_SESSION_ID` and registers
+no process, so nothing ends it but its own server. The server pushes into the inbox Claude Code gave it
+(`CLAUDE_CODE_MESSAGING_SOCKET`: Claude Code drops an inherited one when it starts and sets its own once its inbox
+listens), else the one its own process's entry names, never another's (an inherited `CLAUDE_PID` can be the parent's).
+Claude Code may list its inbox after starting the server: the server registers as `push` once it knows the inbox, and
+until then the daemon posts into the one the registry lists, or leaves the mail for `check_inbox` and says so. A server
+asked to push with no inbox says so, and the mail is unread again: nobody is told it was delivered.
 
 ## Getting messages into agents
 

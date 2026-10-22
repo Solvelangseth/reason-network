@@ -87,7 +87,8 @@ pub struct InboxArgs {
 pub struct ReasonNetworkMcp {
     link: Arc<Link>,
     env_agent: Option<&'static str>,
-    claude: Option<Arc<ClaudeSocket>>,
+    /// The inbox of the Claude Code session we serve, once known (see [`agent::claude_socket`]).
+    claude: Arc<Mutex<Option<Arc<ClaudeSocket>>>>,
     /// The agent named by the client's `clientInfo`, once known.
     client_agent: Arc<Mutex<Option<&'static str>>>,
     tool_router: ToolRouter<Self>,
@@ -98,7 +99,7 @@ pub async fn run() -> Result<()> {
     let server = ReasonNetworkMcp {
         link: Link::new(Some(tx)),
         env_agent: agent::detect_env(),
-        claude: agent::claude_socket().map(Arc::new),
+        claude: Default::default(),
         client_agent: Default::default(),
         tool_router: ReasonNetworkMcp::tool_router(),
     };
@@ -265,9 +266,19 @@ impl ServerHandler for ReasonNetworkMcp {
 }
 
 impl ReasonNetworkMcp {
+    /// Our Claude Code session's inbox: looked for until found (Claude Code may write its registry entry after it starts
+    /// us), then kept.
+    fn claude(&self) -> Option<Arc<ClaudeSocket>> {
+        let mut known = self.claude.lock().unwrap();
+        if known.is_none() {
+            *known = agent::claude_socket().map(Arc::new);
+        }
+        known.clone()
+    }
+
     /// Whether messages reach this session by being pushed into it: Claude Code, through its inbox.
     fn pushed(&self, agent: &str) -> bool {
-        agent == agent::CLAUDE_CODE && self.claude.is_some()
+        agent == agent::CLAUDE_CODE && self.claude().is_some()
     }
 
     /// The agent we serve: the client's `clientInfo` (handshake, or the call's `_meta` on handshake-less
@@ -311,10 +322,11 @@ impl ReasonNetworkMcp {
             Some(id) => format!("{agent}:{id}"),
             None => format!("proc:{}", std::process::id()),
         };
-        if self.link.is_registered(&key) {
+        let tier = if self.pushed(agent) { Tier::Push } else { Tier::Pull };
+        // Registered already, unless its inbox has turned up since (Claude Code may list it after starting us).
+        if self.link.registered_tier(&key).is_some_and(|t| t == Tier::Push || tier != Tier::Push) {
             return Ok(key);
         }
-        let tier = if self.pushed(agent) { Tier::Push } else { Tier::Pull };
         let reg = SessionReg {
             key: key.clone(),
             agent: agent.to_string(),
@@ -361,7 +373,11 @@ impl ReasonNetworkMcp {
 
     async fn on_event(&self, ev: Event) {
         let Event::Deliver { key, ids, text } = ev;
-        let Some(sock) = self.claude.clone() else { return };
+        // No inbox to put it in: the daemon takes it back, and doesn't push here again until there is one.
+        let Some(sock) = self.claude() else {
+            let _ = self.link.call::<Value>(Request::PushFailed { key, ids }).await;
+            return;
+        };
         match tokio::task::spawn_blocking(move || agent::post_to_claude(&sock, &text)).await {
             Ok(Ok(())) => {
                 let _ = self.link.call::<Value>(Request::Delivered { key, ids }).await;
