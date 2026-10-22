@@ -4,15 +4,18 @@
 """
 import json
 import os
+import queue
+import sqlite3
 import subprocess
 import tempfile
+import threading
 import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 BIN = os.path.join(ROOT, "target", "debug", "reason-network")
 
 with tempfile.TemporaryDirectory(prefix="reason-network-codex-") as d:
-    queue = os.path.join(d, "queue.log")
+    queue_log = os.path.join(d, "queue.log")
     fake = os.path.join(d, "codex")
     with open(fake, "w") as f:
         f.write('#!/bin/sh\nprintf "%s\\n" "$*" >> "$CODEX_QUEUE_LOG"\n')
@@ -20,7 +23,7 @@ with tempfile.TemporaryDirectory(prefix="reason-network-codex-") as d:
     env = {k: v for k, v in os.environ.items() if not k.startswith(("CLAUDE", "CODEX", "REASON_NETWORK", "TINCAN"))}
     env.update(REASON_NETWORK_HOME=os.path.join(d, "home"), REASON_NETWORK_NO_MDNS="1",
                REASON_NETWORK_NO_SERVICE="1", REASON_NETWORK_MACHINE="box",
-               REASON_NETWORK_CODEX_BIN=fake, CODEX_QUEUE_LOG=queue)
+               REASON_NETWORK_CODEX_BIN=fake, CODEX_QUEUE_LOG=queue_log)
     proj = os.path.join(d, "proj")
     os.makedirs(proj)
 
@@ -34,9 +37,9 @@ with tempfile.TemporaryDirectory(prefix="reason-network-codex-") as d:
         return run("hook", "codex", event, payload={"session_id": "busy-thread", "cwd": proj})
 
     def queued():
-        if not os.path.exists(queue):
+        if not os.path.exists(queue_log):
             return ""
-        with open(queue) as f:
+        with open(queue_log) as f:
             return f.read()
 
     def rpc(p, request):
@@ -44,10 +47,17 @@ with tempfile.TemporaryDirectory(prefix="reason-network-codex-") as d:
         p.stdin.flush()
         if "id" not in request:
             return None
-        while True:
-            response = json.loads(p.stdout.readline())
-            if response.get("id") == request["id"]:
-                return response
+        responses = queue.Queue()
+
+        def receive():
+            while line := p.stdout.readline():
+                response = json.loads(line)
+                if response.get("id") == request["id"]:
+                    responses.put(response)
+                    return
+
+        threading.Thread(target=receive, daemon=True).start()
+        return responses.get(timeout=10)
 
     cx = None
     try:
@@ -70,8 +80,14 @@ with tempfile.TemporaryDirectory(prefix="reason-network-codex-") as d:
         while "idle message" not in queued() and time.monotonic() < deadline:
             time.sleep(0.02)
         assert "idle message" in queued(), "idle session must still wake via codex queue"
-        # Read completion is acknowledged asynchronously after the queue process exits.
-        time.sleep(0.1)
+        with sqlite3.connect(os.path.join(env["REASON_NETWORK_HOME"], "network.db")) as db:
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                read_at = db.execute("SELECT read_at FROM messages WHERE body = ?", ("idle message",)).fetchone()[0]
+                if read_at is not None:
+                    break
+                time.sleep(0.02)
+            assert read_at is not None, "queue success must be acknowledged, not merely in flight"
         assert hook("post-tool-use") == "", "queued mail must not also arrive through the hook"
         print("PASS: idle Codex still wakes through codex queue, without duplicate hook delivery")
 
