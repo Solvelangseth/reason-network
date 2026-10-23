@@ -112,7 +112,7 @@ With the Reason CLI: `reason network leave`, then `reason network setup --remove
 ```sh
 cargo fmt && cargo clippy --all-targets -- -D warnings && cargo test
 cargo build && python3 tests/e2e/two_machines.py   # two machines over iroh (needs internet)
-python3 tests/e2e/hooks.py && python3 tests/e2e/guided.py
+python3 tests/e2e/hooks.py && python3 tests/e2e/codex_busy.py && python3 tests/e2e/guided.py
 ```
 
 A `v*` tag builds the macOS, Linux and Windows archives and the install scripts; the Reason CLI pins the macOS and
