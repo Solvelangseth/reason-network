@@ -96,6 +96,19 @@ Teammates see your name, your computers, and what your agent sessions are workin
 Signed in with Reason, your name shows as verified: Reason signs that the computer is yours, every teammate's computer
 checks that itself, and nobody else can take the name. State lives in `~/.reason/network`. Details: [DESIGN.md](DESIGN.md).
 
+Direct connections use a random UDP port each time the daemon starts. To open or forward one port in a firewall or
+router instead, set it in `~/.reason/network/config.toml` (per computer; the daemon reads it when it starts):
+
+```toml
+port = 41641
+```
+
+Put `port` at the top of the file, above any `[table]` section such as `[inbound]`. The daemon ignores it under a table.
+
+It is bound on IPv4 and IPv6 (IPv4 alone on a computer without IPv6). If another program holds it on either, the
+daemon logs that and uses a random port, as without it; `port = 0` is the same as leaving it out.
+`reason-network doctor` shows the port in use. Relays work the same either way.
+
 ## Uninstall
 
 ```sh

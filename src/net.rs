@@ -4,7 +4,7 @@
 
 use crate::{
     daemon::Daemon,
-    proto::{Message, SessionInfo},
+    proto::{Message, SessionInfo, UdpPort},
     team::TeamState,
     util,
 };
@@ -13,13 +13,14 @@ use futures_lite::{StreamExt, stream::Boxed};
 use iroh::{
     Endpoint, EndpointAddr, EndpointId, RelayMode, RelayUrl, SecretKey, Watcher,
     address_lookup::{self, AddressLookup, EndpointData, EndpointInfo, Item},
-    endpoint::{ConnectError, ConnectWithOptsError, Connection, RecvStream, SendStream, presets},
+    endpoint::{Builder, ConnectError, ConnectWithOptsError, Connection, RecvStream, SendStream, presets},
     protocol::{AcceptError, ProtocolHandler, Router},
 };
 use iroh_mdns_address_lookup::MdnsAddressLookup;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{
     collections::{HashMap, HashSet},
+    net::{Ipv4Addr, Ipv6Addr},
     sync::{
         Arc, Mutex, Weak,
         atomic::{AtomicU64, Ordering},
@@ -130,6 +131,7 @@ pub struct Net {
     proxy: Option<RelayUrl>,
     /// The proxy's address as looked up for the endpoint.
     at: Option<RelayUrl>,
+    udp: UdpPort,
     router: Mutex<Option<Router>>,
     /// Endpoints listening for joins on behalf of invite codes, by their (code-derived) id.
     invites: Mutex<HashMap<EndpointId, Router>>,
@@ -208,13 +210,15 @@ pub struct Bound {
     pub endpoint: Endpoint,
     proxy: Option<RelayUrl>,
     at: Option<RelayUrl>,
+    udp: UdpPort,
 }
 
 /// An endpoint on the team's own relay (`relay`) or the default ones, the way that last got through, at once. A
-/// running network that stays off its relays tries the other way itself (see `route_loop`).
-pub async fn bind(key: SecretKey, relay: Option<&str>, lan: bool) -> Result<Bound> {
+/// running network that stays off its relays tries the other way itself (see `route_loop`). On UDP `port` if one is
+/// set and free (the network's own endpoint; anything else would take it from that one).
+pub async fn bind(key: SecretKey, relay: Option<&str>, lan: bool, port: Option<u16>) -> Result<Bound> {
     let relays = relays_for(relay).await?;
-    endpoint(&key, &relays, relay.is_some(), lan, route(&relays)).await
+    endpoint(&key, &relays, relay.is_some(), lan, route(&relays), port).await
 }
 
 /// The same, for something a person waits on anyway (a join, checking a relay): if no relay answers the usual way
@@ -223,7 +227,7 @@ pub async fn bind_settled(key: SecretKey, relay: Option<&str>, lan: bool) -> Res
     let relays = relays_for(relay).await?;
     let own = relay.is_some();
     let first = route(&relays);
-    let endpoint = self::endpoint(&key, &relays, own, lan, first.clone()).await?.endpoint;
+    let endpoint = self::endpoint(&key, &relays, own, lan, first.clone(), None).await?.endpoint;
     let Some(proxy) = proxy_for(&relays) else { return Ok((endpoint, relays)) };
     if tokio::time::timeout(FIRST_WAY, endpoint.online()).await.is_ok() {
         return Ok((endpoint, relays));
@@ -237,13 +241,14 @@ pub async fn bind_settled(key: SecretKey, relay: Option<&str>, lan: bool) -> Res
     endpoint.close().await;
     keep_route(&other, &relays);
     log(&format!("on a relay {}", way(&other)));
-    Ok((self::endpoint(&key, &relays, own, lan, other).await?.endpoint, relays))
+    Ok((self::endpoint(&key, &relays, own, lan, other, None).await?.endpoint, relays))
 }
 
 /// Whether a relay answers the `proxy` way, asked by a throwaway endpoint that publishes nothing (this machine's own
 /// stays as it is).
 async fn reaches(relays: &[RelayUrl], proxy: &Option<RelayUrl>) -> bool {
-    let Ok(Bound { endpoint: probe, .. }) = endpoint(&SecretKey::generate(), relays, true, false, proxy.clone()).await
+    let Ok(Bound { endpoint: probe, .. }) =
+        endpoint(&SecretKey::generate(), relays, true, false, proxy.clone(), None).await
     else {
         return false;
     };
@@ -258,27 +263,71 @@ async fn endpoint(
     own: bool,
     lan: bool,
     proxy: Option<RelayUrl>,
+    port: Option<u16>,
 ) -> Result<Bound> {
-    // The default relays, with n0's address lookup still: that is how a teammate on an older Reason Network (on n0's
-    // relays) and this machine find each other, and what four-word codes need. The team's own relay and nothing of
-    // n0's: none of its relays, no publishing or looking up addresses in its DNS; teammates are dialed through it.
-    let relay_mode = RelayMode::custom(relays.to_vec());
-    let mut b = if own { Endpoint::builder(presets::Minimal) } else { Endpoint::builder(presets::N0) }
-        .secret_key(key.clone())
-        .relay_mode(relay_mode);
     let at = match &proxy {
         Some(p) => Some(looked_up(p.clone()).await),
         None => None,
     };
-    if let Some(at) = &at {
-        b = b.proxy_url(at.clone().into());
-    }
-    if lan && own {
-        b = b.address_lookup(NoRelays(MdnsAddressLookup::builder().build(key.public())?));
-    } else if lan {
-        b = b.address_lookup(MdnsAddressLookup::builder());
-    }
-    Ok(Bound { endpoint: b.bind().await?, proxy, at })
+    // The default relays, with n0's address lookup still: that is how a teammate on an older Reason Network (on n0's
+    // relays) and this machine find each other, and what four-word codes need. The team's own relay and nothing of
+    // n0's: none of its relays, no publishing or looking up addresses in its DNS; teammates are dialed through it.
+    let builder = || -> Result<Builder> {
+        let relay_mode = RelayMode::custom(relays.to_vec());
+        let mut b = if own { Endpoint::builder(presets::Minimal) } else { Endpoint::builder(presets::N0) }
+            .secret_key(key.clone())
+            .relay_mode(relay_mode);
+        if let Some(at) = &at {
+            b = b.proxy_url(at.clone().into());
+        }
+        if lan && own {
+            b = b.address_lookup(NoRelays(MdnsAddressLookup::builder().build(key.public())?));
+        } else if lan {
+            b = b.address_lookup(MdnsAddressLookup::builder());
+        }
+        Ok(b)
+    };
+    let fixed = match port {
+        Some(p) => {
+            // IPv6 that works here at all gets the port too, else (taken, refused) a random port on both, as without
+            // one: neither no network nor no IPv6.
+            let v6 = ipv6_works();
+            if !v6 {
+                log(&format!("no IPv6 here: UDP port {p} on IPv4 only"));
+            }
+            match on_port(builder()?, p, v6)?.bind().await {
+                Ok(e) => Some(e),
+                Err(e) => {
+                    log(&format!("couldn't bind UDP port {p} ({e:#}): using a random one"));
+                    None
+                }
+            }
+        }
+        None => None,
+    };
+    let fell_back = port.is_some() && fixed.is_none();
+    let endpoint = match fixed {
+        Some(e) => e,
+        None => builder()?.bind().await?,
+    };
+    Ok(Bound { udp: UdpPort { port: udp_port(&endpoint), fixed: port, fell_back }, endpoint, proxy, at })
+}
+
+/// `b`, on UDP `port` on IPv4, and IPv6 if `v6`, in place of a random port.
+fn on_port(b: Builder, port: u16, v6: bool) -> Result<Builder> {
+    let b = b.bind_addr((Ipv4Addr::UNSPECIFIED, port))?;
+    Ok(if v6 { b.bind_addr((Ipv6Addr::UNSPECIFIED, port))? } else { b })
+}
+
+/// Whether this machine can open an IPv6 UDP socket at all.
+fn ipv6_works() -> bool {
+    std::net::UdpSocket::bind((Ipv6Addr::UNSPECIFIED, 0)).is_ok()
+}
+
+/// The UDP port `endpoint` is on: IPv4's, which it always binds.
+fn udp_port(endpoint: &Endpoint) -> u16 {
+    let socks = endpoint.bound_sockets();
+    socks.iter().find(|a| a.is_ipv4()).or(socks.first()).map_or(0, |a| a.port())
 }
 
 /// An http proxy's name looked up the way curl and everything else on this machine looks it up (hosts file, the
@@ -457,6 +506,24 @@ async fn log_relay(endpoint: Endpoint) {
             r = status.updated() => if r.is_err() { return },
             _ = endpoint.closed() => return,
         }
+    }
+}
+
+/// Says in the log when a connection to a teammate moves between a direct path and the relay, and the new one's rtt.
+async fn log_paths(conn: Connection) {
+    let peer = conn.remote_id().fmt_short().to_string();
+    let kind = |relay: bool| if relay { "relay" } else { "direct" };
+    let mut lists = conn.paths_stream();
+    let mut was = None;
+    while let Some(list) = lists.next().await {
+        let Some(p) = list.iter().find(|p| p.is_selected()) else { continue };
+        let relay = p.is_relay();
+        if let Some(from) = was
+            && from != relay
+        {
+            log(&format!("{peer}: path {} -> {} (rtt {} ms)", kind(from), kind(relay), p.rtt().as_millis()));
+        }
+        was = Some(relay);
     }
 }
 
@@ -701,7 +768,7 @@ impl Net {
         remote: HashMap<EndpointId, Remote>,
     ) -> Arc<Net> {
         let relays: Vec<RelayUrl> = relay.map_or_else(crate::relays::current, |u| u.parse().into_iter().collect());
-        let Bound { endpoint, proxy, at } = bound;
+        let Bound { endpoint, proxy, at, udp } = bound;
         let net = Arc::new_cyclic(|weak: &Weak<Net>| Net {
             me: endpoint.id(),
             router: Mutex::new(Some(
@@ -715,6 +782,7 @@ impl Net {
             relays,
             proxy,
             at,
+            udp,
             daemon: Arc::downgrade(daemon),
             links: Default::default(),
             // Saved by an older build, maybe, which tidied less.
@@ -740,6 +808,10 @@ impl Net {
 
     pub fn addr(&self) -> EndpointAddr {
         self.endpoint.addr()
+    }
+
+    pub fn udp(&self) -> UdpPort {
+        self.udp
     }
 
     /// Waits (up to `limit`) until this machine has a home relay, so addresses handed out include it.
@@ -771,7 +843,7 @@ impl Net {
         relay: Option<&str>,
         lan: bool,
     ) -> Result<()> {
-        let endpoint = bind(key, relay, lan).await?.endpoint;
+        let endpoint = bind(key, relay, lan, None).await?.endpoint;
         let id = endpoint.id();
         let router = Router::builder(endpoint).accept(JOIN_ALPN, JoinProto(Arc::downgrade(self), Some(id))).spawn();
         self.invites.lock().unwrap().insert(id, router);
@@ -980,6 +1052,7 @@ impl Net {
             links.insert(peer, Link { id, tx: tx.clone(), conn: conn.clone(), dialer, since: Instant::now() });
         }
         log(&format!("connected to {} ({})", peer.fmt_short(), if outgoing { "out" } else { "in" }));
+        let paths = tokio::spawn(log_paths(conn.clone()));
 
         let writer = tokio::spawn(async move {
             while let Some(w) = rx.recv().await {
@@ -1022,6 +1095,7 @@ impl Net {
             r.last_seen = util::now_ms();
         }
         writer.abort();
+        paths.abort();
         conn.close(0u32.into(), b"bye");
         res
     }
@@ -1273,7 +1347,7 @@ mod tests {
     #[tokio::test]
     async fn a_link_naming_only_this_machine_says_so() {
         let key = SecretKey::generate();
-        let endpoint = bind(key.clone(), Some("https://relay.example.com"), false).await.unwrap().endpoint;
+        let endpoint = bind(key.clone(), Some("https://relay.example.com"), false, None).await.unwrap().endpoint;
         let req = JoinRequest {
             team: String::new(),
             secret: String::new(),
@@ -1292,7 +1366,7 @@ mod tests {
     #[tokio::test]
     async fn a_link_naming_this_machine_and_offline_ones_says_to_ask_an_online_teammate() {
         let key = SecretKey::generate();
-        let endpoint = bind(key.clone(), Some("https://relay.example.com"), false).await.unwrap().endpoint;
+        let endpoint = bind(key.clone(), Some("https://relay.example.com"), false, None).await.unwrap().endpoint;
         let req = JoinRequest {
             team: String::new(),
             secret: String::new(),
@@ -1308,6 +1382,71 @@ mod tests {
         assert!(e.contains("can't let itself in") && e.contains("ask an online teammate for a fresh link"), "{e}");
         assert!(!e.contains("made the invite"), "{e}");
         assert!(joined.unreachable);
+    }
+
+    #[tokio::test]
+    async fn a_fixed_port_is_used_and_a_taken_one_falls_back_to_a_random_one() {
+        let relay = Some("https://relay.example.com");
+        let free = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).unwrap().local_addr().unwrap().port();
+        let b = bind(SecretKey::generate(), relay, false, Some(free)).await.unwrap();
+        assert_eq!(b.udp, UdpPort { port: free, fixed: Some(free), fell_back: false });
+        assert!(b.endpoint.bound_sockets().iter().all(|a| a.port() == free), "{:?}", b.endpoint.bound_sockets());
+        assert_eq!(b.endpoint.bound_sockets().iter().any(|a| a.is_ipv6()), ipv6_works());
+        b.endpoint.close().await;
+        // Something else holds it: the network still starts, on a random port, and says what it wanted.
+        let taken = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).unwrap();
+        let port = taken.local_addr().unwrap().port();
+        let b = bind(SecretKey::generate(), relay, false, Some(port)).await.unwrap();
+        assert!(b.udp.port != port && b.udp.port != 0 && b.udp.fixed == Some(port) && b.udp.fell_back, "{:?}", b.udp);
+        b.endpoint.close().await;
+        // None set: random, as before.
+        let b = bind(SecretKey::generate(), relay, false, None).await.unwrap();
+        assert!(b.udp.port != 0 && b.udp.fixed.is_none() && !b.udp.fell_back);
+        b.endpoint.close().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_fixed_port_taken_on_ipv6_alone_falls_back_and_keeps_ipv6() {
+        let Some(taken) = v6_only_udp() else {
+            eprintln!("skipped: no IPv6 here");
+            return;
+        };
+        let port = taken.local_addr().unwrap().port();
+        // IPv4 has it free (else the case isn't the one under test).
+        drop(std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, port)).expect("IPv4 side free"));
+        let b = bind(SecretKey::generate(), Some("https://relay.example.com"), false, Some(port)).await.unwrap();
+        let socks = b.endpoint.bound_sockets();
+        assert!(b.udp.fell_back && b.udp.port != port && b.udp.fixed == Some(port), "{:?}", b.udp);
+        assert!(socks.iter().any(|a| a.is_ipv6()) && socks.iter().all(|a| a.port() != port), "{socks:?}");
+        b.endpoint.close().await;
+    }
+
+    /// A UDP socket on a random port of IPv6 alone (`IPV6_V6ONLY`), or None without IPv6.
+    #[cfg(unix)]
+    fn v6_only_udp() -> Option<std::net::UdpSocket> {
+        use std::os::fd::FromRawFd;
+        // SAFETY: a fresh socket, owned (and closed) by the UdpSocket made from it; the option and address are
+        // initialised values of the sizes passed.
+        unsafe {
+            let fd = libc::socket(libc::AF_INET6, libc::SOCK_DGRAM, 0);
+            if fd < 0 {
+                return None;
+            }
+            let sock = std::net::UdpSocket::from_raw_fd(fd);
+            let on: libc::c_int = 1;
+            let len = std::mem::size_of_val(&on) as libc::socklen_t;
+            if libc::setsockopt(fd, libc::IPPROTO_IPV6, libc::IPV6_V6ONLY, (&raw const on).cast(), len) != 0 {
+                return None;
+            }
+            let mut addr: libc::sockaddr_in6 = std::mem::zeroed();
+            addr.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+            let len = std::mem::size_of_val(&addr) as libc::socklen_t;
+            if libc::bind(fd, (&raw const addr).cast(), len) != 0 {
+                return None;
+            }
+            Some(sock)
+        }
     }
 
     #[test]

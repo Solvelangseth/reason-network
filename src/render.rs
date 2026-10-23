@@ -225,6 +225,15 @@ pub fn team(t: &TeamInfo) -> String {
     out
 }
 
+/// The UDP port the network is on, and whether it is the one `port` in the config asked for.
+pub fn udp_port(u: &crate::proto::UdpPort) -> String {
+    match u.fixed {
+        Some(f) if u.fell_back => format!("UDP port {} (random; fixed {f} couldn't be bound)", u.port),
+        Some(_) => format!("UDP port {} (fixed)", u.port),
+        None => format!("UDP port {} (random)", u.port),
+    }
+}
+
 pub fn send_result(r: &SendResult) -> String {
     let mut out = String::new();
     for rc in &r.recipients {
@@ -433,10 +442,23 @@ mod tests {
             machines: Vec::new(),
             features: Vec::new(),
             messages: Vec::new(),
+            udp: None,
         };
         assert_eq!(team(&t), "team vibes · relay: Reason's (the default)\n");
         t.relay = Some("https://relay.example.com".into());
         assert_eq!(team(&t), "team vibes · relay: https://relay.example.com\n");
+    }
+
+    #[test]
+    fn doctor_says_which_udp_port_and_why() {
+        use crate::proto::UdpPort;
+        let u = |port, fixed, fell_back| udp_port(&UdpPort { port, fixed, fell_back });
+        assert_eq!(u(41641, Some(41641), false), "UDP port 41641 (fixed)");
+        assert_eq!(u(53211, None, false), "UDP port 53211 (random)");
+        assert_eq!(u(53211, Some(41641), true), "UDP port 53211 (random; fixed 41641 couldn't be bound)");
+        // `port = 0` reaches the daemon as no port: random, not a missed fixed one.
+        let zero: crate::config::Config = toml::from_str("port = 0\n").unwrap();
+        assert_eq!(u(53211, zero.port(), false), "UDP port 53211 (random)");
     }
 
     /// A directory of one teammate's session, with these fields as its machine and presence gave them.
