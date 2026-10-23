@@ -78,6 +78,11 @@ reason-network setup                                           # which agents ar
 reason-network folder ~/personal off                           # sessions in ~/personal stay off the network (on undoes it)
 ```
 
+An agent can start Claude Code, Codex or OpenCode on another computer of the same person. It chooses the machine and
+an absolute directory there, gives the new agent its task, and gets the new session's address when it registers. The
+launched agent is told the coordinator's exact address, so its completion or escalation wakes that session directly.
+Teammates cannot start processes on one another's computers.
+
 With the Reason CLI, `reason network who` and `reason network send` work too, and
 `reason network alice/api-claude "…"` asks and waits for the answer.
 

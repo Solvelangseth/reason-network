@@ -4,6 +4,7 @@
 
 mod ask;
 mod directory;
+mod launch;
 mod mail;
 mod notify;
 mod reason;
@@ -321,6 +322,9 @@ impl Daemon {
             Request::Who { me, filter, all } => json!(self.who(me, filter, all).await?),
             Request::Send { from, to, body, reply_to, wake, notify, files } => {
                 json!(self.send(from, &to, &body, reply_to, wake, notify, None, files).await?)
+            }
+            Request::Launch { from, machine, agent, cwd, task } => {
+                json!(self.launch(from, &machine, &agent, &cwd, &task).await?)
             }
             Request::Inbox { key, wait_secs, peek } => json!(self.inbox(key, wait_secs.min(MAX_WAIT), peek).await?),
             Request::Unread { key } => json!(self.unread(&key)?),

@@ -124,6 +124,16 @@ pub enum Request {
         #[serde(default)]
         files: Vec<Attachment>,
     },
+    /// Start a supported coding agent on one of this person's machines.
+    Launch {
+        /// The requesting agent session's key.
+        from: String,
+        /// Machine name as shown by `list_team` / `who`.
+        machine: String,
+        agent: String,
+        cwd: String,
+        task: String,
+    },
     /// A session's unread messages. With `peek` nothing is marked read: the client acknowledges with `Delivered`
     /// after showing the messages, so nothing is lost if it goes away first.
     Inbox {
@@ -348,6 +358,28 @@ pub struct Registered {
     pub name: String,
     pub address: String,
     pub unread: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LaunchSpec {
+    pub id: String,
+    /// Exact Reason Network address of the coordinator that requested the launch.
+    pub coordinator: String,
+    pub agent: String,
+    pub cwd: String,
+    pub task: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LaunchResult {
+    pub id: String,
+    pub machine: String,
+    pub agent: String,
+    pub cwd: String,
+    /// Filled once the new session registers within the launch wait.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
+    pub note: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

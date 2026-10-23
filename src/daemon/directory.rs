@@ -264,7 +264,11 @@ impl Daemon {
             sessions,
             known: known.into_iter().take(PRESENCE_NAMES).map(|r| r.name).collect(),
             kept: kept.into_iter().take(PRESENCE_NAMES).collect(),
-            features: vec![crate::files::FEATURE.into(), super::sessions::TERMINALS.into()],
+            features: vec![
+                crate::files::FEATURE.into(),
+                super::sessions::TERMINALS.into(),
+                super::launch::FEATURE.into(),
+            ],
         }
     }
 

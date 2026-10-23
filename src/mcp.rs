@@ -83,6 +83,18 @@ pub struct InboxArgs {
     pub wait_secs: Option<u64>,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct LaunchArgs {
+    /// Target machine name as shown by list_team.
+    pub machine: String,
+    /// Supported coding agent: claude, codex, or opencode.
+    pub agent: String,
+    /// Absolute working directory on the target machine.
+    pub directory: String,
+    /// Initial task for the new agent.
+    pub task: String,
+}
+
 #[derive(Clone)]
 pub struct ReasonNetworkMcp {
     link: Arc<Link>,
@@ -177,6 +189,28 @@ impl ReasonNetworkMcp {
         };
         // Notes are teammates' machines' words.
         let res = self.link.call::<SendResult>(req).await.map(|r| render::defang(&render::send_result(&r)));
+        Ok(self.finish(&key, res, true).await)
+    }
+
+    #[tool(
+        description = "Start a supported coding agent on one of your own computers, in a specified directory, with an initial task. The new agent is told to reply directly to this session."
+    )]
+    async fn start_agent(
+        &self,
+        Parameters(a): Parameters<LaunchArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let key = match self.session_for(&ctx).await {
+            Ok(k) => k,
+            Err(e) => return Ok(failure(e)),
+        };
+        let req =
+            Request::Launch { from: key.clone(), machine: a.machine, agent: a.agent, cwd: a.directory, task: a.task };
+        let res = self
+            .link
+            .call::<LaunchResult>(req)
+            .await
+            .map(|r| r.address.map_or_else(|| r.note.clone(), |address| format!("{}\nSession: {address}", r.note)));
         Ok(self.finish(&key, res, true).await)
     }
 

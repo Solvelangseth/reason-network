@@ -156,6 +156,20 @@ enum Cmd {
         #[arg(long = "file", value_name = "PATH")]
         files: Vec<String>,
     },
+    /// Start a coding agent on one of your computers with an initial task
+    Start {
+        /// Machine name as shown by `who`
+        machine: String,
+        /// Supported agent: claude, codex, or opencode
+        agent: String,
+        /// Absolute working directory on the target machine
+        directory: String,
+        /// Initial task
+        task: Vec<String>,
+        /// Start on behalf of this registered local session (used by terminal automation)
+        #[arg(long)]
+        from: Option<String>,
+    },
     /// Set what the current agent session is doing (run from inside the agent's shell)
     Status {
         doing: Vec<String>,
@@ -478,6 +492,23 @@ async fn cli(cmd: Cmd) -> Result<()> {
                 }
             };
             print!("{}", shown(&render::send_result(&r)));
+        }
+        Cmd::Start { machine, agent, directory, task, from } => {
+            let from = from.or_else(current_session).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "start must be run by a registered agent session; agents also have the start_agent tool"
+                )
+            })?;
+            let task = task.join(" ");
+            if task.trim().is_empty() {
+                bail!("empty task");
+            }
+            let result: LaunchResult =
+                link.call(Request::Launch { from, machine, agent, cwd: directory, task }).await?;
+            println!("{}", shown(&result.note));
+            if let Some(address) = result.address {
+                println!("Session: {}", shown(&address));
+            }
         }
         Cmd::Status { doing, name } => {
             let Some(key) = current_session() else {
