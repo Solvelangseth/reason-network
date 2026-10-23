@@ -1,5 +1,8 @@
 """Codex delivery routing against an isolated daemon and a queue-accepting CLI.
 
+The fake CLI records accepted queue commands; it does not prove that real Codex
+supports `queue`, resumes a thread, or displays the message.
+
     cargo build && python3 tests/e2e/codex_busy.py
 """
 import json
@@ -33,8 +36,8 @@ with tempfile.TemporaryDirectory(prefix="reason-network-codex-") as d:
         assert r.returncode == 0, r.stdout + r.stderr
         return (r.stdout + r.stderr).strip()
 
-    def hook(event):
-        return run("hook", "codex", event, payload={"session_id": "busy-thread", "cwd": proj})
+    def hook(event, session="busy-thread", cwd=proj):
+        return run("hook", "codex", event, payload={"session_id": session, "cwd": cwd})
 
     def queued():
         if not os.path.exists(queue_log):
@@ -107,6 +110,50 @@ with tempfile.TemporaryDirectory(prefix="reason-network-codex-") as d:
         assert "polled FYI" in json.dumps(response), response
         assert "polled FYI" not in queued(), "FYI must not wake the session"
         print("PASS: --fyi plus explicit check_inbox returns mail without a queue wake")
+
+        # Both turns abort after a tool hook: neither emits Stop or another mail-consuming hook.
+        quiet_proj = os.path.join(d, "quiet")
+        os.makedirs(quiet_proj)
+        hook("session-start", session="quiet-thread", cwd=quiet_proj)
+        hook("user-prompt-submit", session="quiet-thread", cwd=quiet_proj)
+        assert hook("post-tool-use", session="quiet-thread", cwd=quiet_proj) == ""
+        hook("user-prompt-submit")
+        assert hook("post-tool-use") == ""
+        started = time.monotonic()
+        run("send", "proj-codex", "aborted turn pending message")
+        run("who")
+        assert "aborted turn pending message" not in queued(), "fresh busy mail must wait for a hook"
+        print("Waiting 125 seconds for unconsumed busy mail and quiet busy status to expire", flush=True)
+        time.sleep(max(0, started + 125 - time.monotonic()))
+        pending_queued = "aborted turn pending message" in queued()
+
+        # This mailbox had no pending mail during the entire stale-busy interval.
+        out = run("send", "quiet-codex", "quiet stale busy message")
+        deadline = time.monotonic() + 5
+        while "quiet stale busy message" not in queued() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        late_queued = "quiet stale busy message" in queued()
+        failures = []
+        if not pending_queued:
+            failures.append("unconsumed busy mail never fell back to codex queue after 125 seconds")
+        if not late_queued:
+            failures.append(f"mail after quiet stale busy status did not wake through codex queue: {out!r}")
+        assert not failures, "; ".join(failures)
+
+        with sqlite3.connect(os.path.join(env["REASON_NETWORK_HOME"], "network.db")) as db:
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                unread = db.execute("SELECT COUNT(*) FROM messages WHERE body IN (?, ?) AND read_at IS NULL",
+                                    ("aborted turn pending message", "quiet stale busy message")).fetchone()[0]
+                if unread == 0:
+                    break
+                time.sleep(0.02)
+            assert unread == 0, "aborted-turn queue successes must be acknowledged"
+        assert hook("post-tool-use") == "", "fallback mail must not also arrive through the hook"
+        assert hook("post-tool-use", session="quiet-thread", cwd=quiet_proj) == "", "late mail must arrive once"
+        assert queued().count("aborted turn pending message") == 1, "pending fallback must queue once"
+        assert queued().count("quiet stale busy message") == 1, "quiet stale session must queue once"
+        print("PASS: aborted turn falls back after 120 seconds, including mail after quiet stale busy status")
     finally:
         if cx:
             cx.kill()

@@ -31,6 +31,7 @@ const LOOP_LIMIT: usize = 12;
 const LOOP_WINDOW: Duration = Duration::from_secs(600);
 /// A push or hook not confirmed within this long is shown through the inbox and hooks again.
 const IN_FLIGHT_TTL: Duration = Duration::from_secs(90);
+const CODEX_HOOK_WAIT: Duration = Duration::from_secs(120);
 
 /// How a session on this machine gets a message into its conversation.
 enum Channel {
@@ -333,7 +334,7 @@ impl Daemon {
                 Channel::ClaudeSocket(conn)
             }
             _ if l.reg.agent == "codex"
-                && l.last_hook.is_some()
+                && l.last_hook.is_some_and(|at| util::now_ms() - at < CODEX_HOOK_WAIT.as_millis() as i64)
                 && l.status.as_ref().is_some_and(|(s, _)| s == "busy") =>
             {
                 Channel::Hook
@@ -401,7 +402,38 @@ impl Daemon {
                     .unwrap_or("delivered into the session: it reads it between tool calls, or wakes up if idle");
                 ("pushed".into(), note.into())
             }
-            Channel::Hook => ("queued".into(), hook_note.into()),
+            Channel::Hook => {
+                if l.reg.agent == "codex" && has("codex") {
+                    let this = self.clone();
+                    let key = key.to_string();
+                    tokio::spawn(async move {
+                        let mut ids = ids;
+                        // Codex can abort a turn without Stop. Don't leave its mail waiting for a hook forever.
+                        loop {
+                            tokio::time::sleep(CODEX_HOOK_WAIT).await;
+                            let mut g = this.inner.lock().unwrap();
+                            let Some(address) = g.live.get(&key).map(|l| this.addr(&l.name)) else { return };
+                            if !g.store.unread(&address).unwrap_or_default().iter().any(|m| ids.contains(&m.id)) {
+                                return;
+                            }
+                            let waiting: Vec<_> = g
+                                .pending(&address)
+                                .unwrap_or_default()
+                                .into_iter()
+                                .filter(|m| m.wake && ids.contains(&m.id))
+                                .collect();
+                            if !waiting.is_empty() {
+                                ids.retain(|id| !waiting.iter().any(|m| &m.id == id));
+                                this.deliver(&mut g, &key, waiting, true);
+                                if ids.is_empty() {
+                                    return;
+                                }
+                            }
+                        }
+                    });
+                }
+                ("queued".into(), hook_note.into())
+            }
             Channel::Pull => ("queued".into(), "queued: this agent only sees it when it checks its inbox".into()),
         }
     }
