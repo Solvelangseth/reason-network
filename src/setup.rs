@@ -1542,6 +1542,13 @@ mod tests {
         assert!(!hooks.contains_key("PostToolUse"));
     }
 
+    #[test]
+    fn opencode_plugin_handles_current_idle_events() {
+        let plugin = include_str!("opencode-plugin.ts");
+        assert!(plugin.contains("session.idle"));
+        assert!(plugin.contains("e.type === \"session.status\""));
+    }
+
     const DSH_PATCH: &str = "# Your patch layer\n\n- id: agent-loop\n  config:\n    maxParallelToolCalls: 20\n";
 
     #[test]

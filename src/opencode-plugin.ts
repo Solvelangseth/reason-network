@@ -108,8 +108,9 @@ const ReasonNetwork: Plugin = async ({ client, directory }) => {
   }
 }
 
-// opencode 2.x has no todo events, and a session's busy and idle come as its execution starting and ending (it
-// doesn't send session.status).
+// Recent opencode 2.x releases expose idle through session.status/session.idle. Older 2.x builds also emitted the
+// execution lifecycle events below, so accept both shapes: a missed idle event leaves a delivered message unread until
+// the next turn instead of waking the worker.
 const STATE: Record<string, string> = {
   "session.execution.started": "busy",
   "session.execution.succeeded": "idle",
@@ -132,7 +133,9 @@ export default {
         const dir = e.location?.directory ?? ctx.location.directory
         if (e.type === "session.created" && d.parentID) net.subagent(d.sessionID)
         if (e.type === "session.renamed") net.title(d.sessionID, d.title, dir)
-        if (STATE[e.type]) void net.status(d.sessionID, STATE[e.type], dir)
+        const state = STATE[e.type] ??
+          (e.type === "session.idle" ? "idle" : e.type === "session.status" ? d.status?.type : undefined)
+        if (state === "busy" || state === "idle") void net.status(d.sessionID, state, dir)
         if (e.type === "session.deleted") net.end(d.sessionID)
       }
     })().catch(() => {})

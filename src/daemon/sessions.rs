@@ -645,6 +645,32 @@ mod tests {
         }
     }
 
+    #[test]
+    fn multiplexed_sessions_keep_their_identity_and_clean_up_with_their_connection() {
+        let d = super::super::test_daemon(Default::default());
+        let connection = 42;
+        for id in ["first", "second"] {
+            let reg = named(&format!("opencode:{id}"), "opencode", None);
+            d.register_quiet(Some(connection), reg, GitInfo::default()).unwrap();
+        }
+        let other = named("opencode:other", "opencode", None);
+        d.register_quiet(Some(connection + 1), other, GitInfo::default()).unwrap();
+
+        {
+            let g = d.inner.lock().unwrap();
+            assert_eq!(g.live.len(), 3);
+            assert!(g.live.contains_key("opencode:first"));
+            assert!(g.live.contains_key("opencode:second"));
+        }
+
+        d.drop_conn(connection);
+
+        let g = d.inner.lock().unwrap();
+        assert!(!g.live.contains_key("opencode:first"));
+        assert!(!g.live.contains_key("opencode:second"));
+        assert!(g.live.contains_key("opencode:other"));
+    }
+
     /// Registers a session through an MCP server of its own, as Claude Code runs one per session; a `cli` one as
     /// `listen --as` does, as one of the person's own mailboxes.
     fn join(d: &Daemon, reg: SessionReg) -> Registered {
