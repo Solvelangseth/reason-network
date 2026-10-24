@@ -153,6 +153,8 @@ struct Inner {
     off: HashMap<String, (bool, i64)>,
     /// Codex sessions whose wake mail waits for a hook of the turn they are in, watched for that turn ending first.
     codex_watch: HashSet<String>,
+    /// Locally launched worker supervisors, keyed by their Reason run id.
+    launches: HashMap<String, u32>,
 }
 
 /// A session running on this machine.
@@ -227,6 +229,7 @@ impl Daemon {
                 quota: Default::default(),
                 off: HashMap::new(),
                 codex_watch: HashSet::new(),
+                launches: HashMap::new(),
             }),
             arrived: Notify::new(),
             git_cache: Mutex::new(HashMap::new()),
@@ -326,6 +329,7 @@ impl Daemon {
             Request::Launch { from, machine, agent, cwd, task } => {
                 json!(self.launch(from, &machine, &agent, &cwd, &task).await?)
             }
+            Request::StopRun { from, machine, id } => json!(self.stop_run(&from, &machine, &id).await?),
             Request::Inbox { key, wait_secs, peek } => json!(self.inbox(key, wait_secs.min(MAX_WAIT), peek).await?),
             Request::Unread { key } => json!(self.unread(&key)?),
             Request::Ask { key, question, about } => json!(self.ask(key, question, about).await?),

@@ -29,6 +29,8 @@ Progress on `feat/agent-launch`:
 - a Claude Code launch correctly reports its immediate workspace-trust failure instead of claiming it started;
 - the first remote test setup was reclaimed by the Linux systemd service before the development daemon got its lock;
   repeat after the OpenCode test session returns and temporarily stop, without disabling, that user service.
+- OpenCode launch now uses a local headless server plus an attached task, so the worker server stays alive after its
+  first task; `stop_run` terminates the recorded worker process locally or on the owner's other machine.
 
 ## Later
 

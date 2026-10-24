@@ -4,7 +4,7 @@
 
 use crate::{
     daemon::Daemon,
-    proto::{LaunchResult, LaunchSpec, Message, SessionInfo, UdpPort},
+    proto::{LaunchResult, LaunchSpec, Message, SessionInfo, StopSpec, UdpPort},
     team::TeamState,
     util,
 };
@@ -75,6 +75,17 @@ pub enum Wire {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         result: Option<LaunchResult>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+    Stop {
+        stop: StopSpec,
+    },
+    StopAck {
+        id: String,
+        ok: bool,
+        #[serde(default)]
+        result: Option<String>,
+        #[serde(default)]
         error: Option<String>,
     },
 }
@@ -165,6 +176,7 @@ pub struct Net {
     remote: Mutex<HashMap<EndpointId, Remote>>,
     acks: Mutex<HashMap<String, oneshot::Sender<(String, String)>>>,
     launches: Mutex<HashMap<String, oneshot::Sender<Result<LaunchResult, String>>>>,
+    stops: Mutex<HashMap<String, oneshot::Sender<Result<String, String>>>>,
     dialing: Mutex<HashSet<EndpointId>>,
     wake: Notify,
     /// A local session came or went: announce it now, not at the next tick.
@@ -816,6 +828,7 @@ impl Net {
             ),
             acks: Default::default(),
             launches: Default::default(),
+            stops: Default::default(),
             dialing: Default::default(),
             wake: Notify::new(),
             changed: Notify::new(),
@@ -973,6 +986,30 @@ impl Net {
             _ => {
                 self.launches.lock().unwrap().remove(&launch.id);
                 bail!("target machine did not answer the launch request")
+            }
+        }
+    }
+
+    pub async fn send_stop(&self, target: &EndpointId, stop: &StopSpec) -> Result<String> {
+        let tx = self
+            .links
+            .lock()
+            .unwrap()
+            .get(target)
+            .map(|l| l.tx.clone())
+            .ok_or_else(|| anyhow!("target machine is offline"))?;
+        let (otx, orx) = oneshot::channel();
+        self.stops.lock().unwrap().insert(stop.id.clone(), otx);
+        if tx.send(Wire::Stop { stop: stop.clone() }).is_err() {
+            self.stops.lock().unwrap().remove(&stop.id);
+            bail!("target machine disconnected before the stop request was sent");
+        }
+        match tokio::time::timeout(Duration::from_secs(10), orx).await {
+            Ok(Ok(Ok(result))) => Ok(result),
+            Ok(Ok(Err(error))) => bail!(error),
+            _ => {
+                self.stops.lock().unwrap().remove(&stop.id);
+                bail!("target machine did not answer the stop request")
             }
         }
     }
@@ -1206,6 +1243,28 @@ impl Net {
                         result.ok_or_else(|| "target returned an empty launch result".to_string())
                     } else {
                         Err(error.unwrap_or_else(|| "target refused the launch".to_string()))
+                    };
+                    let _ = waiter.send(answer);
+                }
+            }
+            Wire::Stop { stop } => {
+                let id = stop.id.clone();
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    let answer = daemon.receive_stop(peer, stop).await;
+                    let (ok, result, error) = match answer {
+                        Ok(result) => (true, Some(result), None),
+                        Err(e) => (false, None, Some(format!("{e:#}"))),
+                    };
+                    let _ = tx.send(Wire::StopAck { id, ok, result, error });
+                });
+            }
+            Wire::StopAck { id, ok, result, error } => {
+                if let Some(waiter) = self.stops.lock().unwrap().remove(&id) {
+                    let answer = if ok {
+                        result.ok_or_else(|| "target returned an empty stop result".to_string())
+                    } else {
+                        Err(error.unwrap_or_else(|| "target refused the stop".to_string()))
                     };
                     let _ = waiter.send(answer);
                 }

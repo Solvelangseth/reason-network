@@ -81,6 +81,7 @@ reason-network folder ~/personal off                           # sessions in ~/p
 An agent can start Claude Code, Codex or OpenCode on another computer of the same person. It chooses the machine and
 an absolute directory there, gives the new agent its task, and gets the new session's address when it registers. The
 launched agent is told the coordinator's exact address, so its completion or escalation wakes that session directly.
+OpenCode workers run through a persistent headless server and remain available until `stop_run` terminates the run.
 Teammates cannot start processes on one another's computers.
 
 With the Reason CLI, `reason network who` and `reason network send` work too, and

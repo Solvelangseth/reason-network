@@ -95,6 +95,14 @@ pub struct LaunchArgs {
     pub task: String,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct StopRunArgs {
+    /// Run id returned by start_agent.
+    pub id: String,
+    /// Machine where the worker was started.
+    pub machine: String,
+}
+
 #[derive(Clone)]
 pub struct ReasonNetworkMcp {
     link: Arc<Link>,
@@ -206,11 +214,27 @@ impl ReasonNetworkMcp {
         };
         let req =
             Request::Launch { from: key.clone(), machine: a.machine, agent: a.agent, cwd: a.directory, task: a.task };
-        let res = self
-            .link
-            .call::<LaunchResult>(req)
-            .await
-            .map(|r| r.address.map_or_else(|| r.note.clone(), |address| format!("{}\nSession: {address}", r.note)));
+        let res = self.link.call::<LaunchResult>(req).await.map(|r| {
+            let session = r.address.map_or_else(String::new, |address| format!("\nSession: {address}"));
+            let pid = r.pid.map_or_else(String::new, |pid| format!("\nProcess: {pid}"));
+            format!("Run: {}\n{}{session}{pid}", r.id, r.note)
+        });
+        Ok(self.finish(&key, res, true).await)
+    }
+
+    #[tool(
+        description = "Stop a worker previously started by this coordinator on this machine. Use the run id returned by start_agent."
+    )]
+    async fn stop_run(
+        &self,
+        Parameters(a): Parameters<StopRunArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let key = match self.session_for(&ctx).await {
+            Ok(k) => k,
+            Err(e) => return Ok(failure(e)),
+        };
+        let res = self.link.call::<String>(Request::StopRun { from: key.clone(), machine: a.machine, id: a.id }).await;
         Ok(self.finish(&key, res, true).await)
     }
 

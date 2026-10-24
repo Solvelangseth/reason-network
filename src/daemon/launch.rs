@@ -3,7 +3,7 @@
 use super::Daemon;
 use crate::{
     agent,
-    proto::{LaunchResult, LaunchSpec},
+    proto::{LaunchResult, LaunchSpec, StopSpec},
 };
 use anyhow::{Result, anyhow, bail};
 use iroh::EndpointId;
@@ -21,6 +21,58 @@ const MAX_TASK: usize = 64 * 1024;
 const REGISTER_WAIT: Duration = Duration::from_secs(12);
 
 impl Daemon {
+    pub(super) async fn stop_run(&self, from: &str, machine: &str, id: &str) -> Result<String> {
+        if machine != self.machine {
+            let team = self.team_state().ok_or_else(|| anyhow!("this machine is not in a Reason Network team"))?;
+            let member = team
+                .active()
+                .find(|m| m.person == self.person && m.machine == machine)
+                .ok_or_else(|| anyhow!("no machine called '{machine}' belongs to {}", self.person))?;
+            let net = self.net().ok_or_else(|| anyhow!("Reason Network is not connected"))?;
+            let remote =
+                net.remotes().get(&member.endpoint).cloned().ok_or_else(|| anyhow!("{machine} has not been seen"))?;
+            if !remote.online {
+                bail!("{machine} is offline");
+            }
+            return net.send_stop(&member.endpoint, &StopSpec { id: id.into(), coordinator: from.into() }).await;
+        }
+        let g = self.inner.lock().unwrap();
+        if !g.live.contains_key(from) && !g.live.values().any(|l| self.addr(&l.name) == from || l.name == from) {
+            bail!("the requesting agent session is not registered");
+        }
+        drop(g);
+        self.stop_pid(id)
+    }
+
+    pub(crate) async fn receive_stop(self: &Arc<Self>, peer: EndpointId, stop: StopSpec) -> Result<String> {
+        let team = self.team_state().ok_or_else(|| anyhow!("this machine is not in a Reason Network team"))?;
+        let sender =
+            team.member(&peer).filter(|m| m.active).ok_or_else(|| anyhow!("sender is not an active member"))?;
+        if sender.person != self.person {
+            bail!("only another machine owned by {} may stop a worker here", self.person);
+        }
+        self.stop_pid(&stop.id)
+    }
+
+    fn stop_pid(&self, id: &str) -> Result<String> {
+        let g = &mut *self.inner.lock().unwrap();
+        let Some(pid) = g.launches.remove(id) else {
+            bail!("no running local worker with run id {id}");
+        };
+        #[cfg(unix)]
+        {
+            let result = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+            if result != 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::NotFound {
+                bail!("could not stop worker process {pid}: {}", std::io::Error::last_os_error());
+            }
+        }
+        #[cfg(windows)]
+        {
+            let _ = std::process::Command::new("taskkill").args(["/PID", &pid.to_string(), "/T", "/F"]).status();
+        }
+        Ok(format!("stopped worker {id} (process {pid})"))
+    }
+
     pub(super) async fn launch(
         self: &Arc<Self>,
         from: String,
@@ -94,7 +146,10 @@ impl Daemon {
             launch.task.trim(),
             launch.coordinator
         );
-        start(&launch.agent, &cwd, &prompt).await?;
+        let pid = start(&launch.agent, &cwd, &prompt).await?;
+        if let Some(pid) = pid {
+            self.inner.lock().unwrap().launches.insert(launch.id.clone(), pid);
+        }
 
         let deadline = tokio::time::Instant::now() + REGISTER_WAIT;
         let mut address = None;
@@ -120,6 +175,7 @@ impl Daemon {
             cwd: cwd.to_string_lossy().into_owned(),
             address,
             note,
+            pid,
         })
     }
 }
@@ -163,11 +219,93 @@ fn same_dir(given: &str, expected: &Path) -> bool {
     Path::new(given).canonicalize().is_ok_and(|p| p == expected)
 }
 
-async fn start(agent_name: &str, cwd: &Path, prompt: &str) -> Result<()> {
+async fn start(agent_name: &str, cwd: &Path, prompt: &str) -> Result<Option<u32>> {
     let bin_name = if agent_name == agent::CLAUDE_CODE { "claude" } else { agent_name };
     let bin = agent::find_bin(bin_name).ok_or_else(|| anyhow!("{bin_name} is not installed on this machine"))?;
-    let mut cmd = tokio::process::Command::new(bin);
+    let mut cmd = tokio::process::Command::new(&bin);
     cmd.current_dir(cwd).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
+    clean_agent_env(&mut cmd);
+    if agent_name == "opencode" {
+        let port = std::net::TcpListener::bind(("127.0.0.1", 0))?.local_addr()?.port();
+        let mut server = tokio::process::Command::new(&bin);
+        server
+            .current_dir(cwd)
+            .args(["serve", "--hostname", "127.0.0.1", "--port", &port.to_string()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        clean_agent_env(&mut server);
+        let mut server =
+            server.kill_on_drop(false).spawn().map_err(|e| anyhow!("could not start opencode server: {e}"))?;
+        let pid = server.id().ok_or_else(|| anyhow!("opencode server did not expose a process id"))?;
+        let address = format!("http://127.0.0.1:{port}");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while tokio::time::Instant::now() < deadline {
+            if tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
+                let mut client = tokio::process::Command::new(&bin);
+                client
+                    .current_dir(cwd)
+                    .args(["run", "--attach", &address, "--dir", &cwd.to_string_lossy(), prompt])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .kill_on_drop(false);
+                clean_agent_env(&mut client);
+                client.spawn().map_err(|e| anyhow!("could not send the initial opencode task: {e}"))?;
+                tokio::spawn(async move {
+                    let _ = server.wait().await;
+                });
+                super::log(&format!("launch persistent opencode server in {}", cwd.display()));
+                return Ok(Some(pid));
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let _ = server.kill().await;
+        bail!("opencode server did not start listening within 10 seconds");
+    }
+    match agent_name {
+        agent::CLAUDE_CODE => {
+            cmd.arg("--bg").arg(prompt);
+        }
+        "codex" => {
+            cmd.arg("exec").arg(prompt);
+        }
+        "opencode" => {
+            cmd.arg("run").arg(prompt);
+        }
+        _ => unreachable!(),
+    }
+    let mut child = cmd.kill_on_drop(false).spawn().map_err(|e| anyhow!("could not start {bin_name}: {e}"))?;
+    let mut stderr = child.stderr.take();
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let pid = child.id();
+    if let Some(status) = child.try_wait().map_err(|e| anyhow!("could not inspect {bin_name}: {e}"))? {
+        let mut detail = String::new();
+        if let Some(mut pipe) = stderr.take() {
+            let _ = pipe.read_to_string(&mut detail).await;
+        }
+        if !status.success() {
+            let detail = detail.trim();
+            bail!(
+                "{bin_name} exited before starting{}",
+                if detail.is_empty() { String::new() } else { format!(": {detail}") }
+            );
+        }
+    } else {
+        // Reap the long-running worker and drain its diagnostics without tying its lifetime to this request.
+        tokio::spawn(async move {
+            if let Some(mut pipe) = stderr {
+                let mut sink = Vec::new();
+                let _ = pipe.read_to_end(&mut sink).await;
+            }
+            let _ = child.wait().await;
+        });
+    }
+    super::log(&format!("launch {agent_name} in {}", cwd.display()));
+    Ok(pid)
+}
+
+fn clean_agent_env(cmd: &mut tokio::process::Command) {
     // The daemon may have been started on demand from inside another agent's shell. None of that caller's session
     // identity belongs to the child; each launched harness establishes its own identity.
     for name in [
@@ -194,45 +332,6 @@ async fn start(agent_name: &str, cwd: &Path, prompt: &str) -> Result<()> {
     ] {
         cmd.env_remove(name);
     }
-    match agent_name {
-        agent::CLAUDE_CODE => {
-            cmd.arg("--bg").arg(prompt);
-        }
-        "codex" => {
-            cmd.arg("exec").arg(prompt);
-        }
-        "opencode" => {
-            cmd.arg("run").arg(prompt);
-        }
-        _ => unreachable!(),
-    }
-    let mut child = cmd.kill_on_drop(false).spawn().map_err(|e| anyhow!("could not start {bin_name}: {e}"))?;
-    let mut stderr = child.stderr.take();
-    tokio::time::sleep(Duration::from_millis(1500)).await;
-    if let Some(status) = child.try_wait().map_err(|e| anyhow!("could not inspect {bin_name}: {e}"))? {
-        let mut detail = String::new();
-        if let Some(mut pipe) = stderr.take() {
-            let _ = pipe.read_to_string(&mut detail).await;
-        }
-        if !status.success() {
-            let detail = detail.trim();
-            bail!(
-                "{bin_name} exited before starting{}",
-                if detail.is_empty() { String::new() } else { format!(": {detail}") }
-            );
-        }
-    } else {
-        // Reap the long-running worker and drain its diagnostics without tying its lifetime to this request.
-        tokio::spawn(async move {
-            if let Some(mut pipe) = stderr {
-                let mut sink = Vec::new();
-                let _ = pipe.read_to_end(&mut sink).await;
-            }
-            let _ = child.wait().await;
-        });
-    }
-    super::log(&format!("launch {agent_name} in {}", cwd.display()));
-    Ok(())
 }
 
 #[cfg(test)]

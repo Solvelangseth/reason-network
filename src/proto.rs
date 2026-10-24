@@ -134,6 +134,12 @@ pub enum Request {
         cwd: String,
         task: String,
     },
+    /// Stop a locally launched worker owned by the requesting session.
+    StopRun {
+        from: String,
+        machine: String,
+        id: String,
+    },
     /// A session's unread messages. With `peek` nothing is marked read: the client acknowledges with `Delivered`
     /// after showing the messages, so nothing is lost if it goes away first.
     Inbox {
@@ -380,6 +386,15 @@ pub struct LaunchResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub address: Option<String>,
     pub note: String,
+    /// PID of a persistent worker process, when the launcher owns one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StopSpec {
+    pub id: String,
+    pub coordinator: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
