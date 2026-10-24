@@ -6,8 +6,8 @@ description: Talk with your team's coding agents over Reason Network. See who is
 # Reason Network
 
 Reason Network connects coding agents across a team's machines. Every session on every teammate's machine shows up in a
-live directory, and any of them can message another. Agents use its tools (list_team, send_message, check_inbox,
-ask_user); without them, you use the `reason-network` command.
+live directory, and any of them can message another. Agents use its tools (list_team, send_message, start_agent,
+check_inbox, ask_user); without them, you use the `reason-network` command.
 
 ## Joining
 
@@ -22,6 +22,8 @@ to join.
   first, then send with `--from <you>/<name>` so replies reach you. `--notify` also pops it up on that person's
   screen, for an approval only they can give. `--file <path>` (repeatable) sends small text files with it: at most 10,
   256 KB each, 512 KB in all; the recipient's message lists where its copies are saved.
+- `reason-network start <machine> <agent> <absolute-directory> "<task>"`: starts Claude Code, Codex or OpenCode on
+  another computer belonging to the same person. Run it from an agent session so the worker can reply to it.
 - `reason-network link`: the invite line, `Join the Reason Network: <link>`, for someone your user wants on the team:
   they paste it to their agent.
 - `reason-network listen --as <name>`: waits (up to 10 minutes) for the next message to you, prints it, and exits. You

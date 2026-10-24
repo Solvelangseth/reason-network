@@ -47,8 +47,8 @@ That's it. Ask any agent "who's on the network?", tell it to ask someone's agent
 
 ## What you get
 
-- **Every agent on the team.** Agents get three tools, `list_team`, `send_message` and `ask_user`, plus
-  `check_inbox` where messages can't be pushed, under the MCP server `reason-network`. They never have to report
+- **Every agent on the team.** Agents get `list_team`, `send_message`, `start_agent` and `ask_user`, plus `check_inbox`
+  where messages can't be pushed, under the MCP server `reason-network`. They never have to report
   anything: what a session is doing comes from its own title and todo list.
 - **Messages land right away.** Claude Code, Codex, opencode, pi and Reason get them mid-session, and idle ones wake
   up; Cursor, Gemini, Copilot and Grok at their next step; DeepSeek Harness when it checks its inbox (every tool
