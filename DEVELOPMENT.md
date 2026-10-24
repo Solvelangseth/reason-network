@@ -92,7 +92,7 @@ must not store credentials or full transcripts by default.
 
 ### Coordinated restart workflow
 
-Use `/restart` in the coordinator conversation as the shorthand for refreshing the Reason Network engine and notifying
+Use `!restart` in the coordinator conversation as the shorthand for refreshing the Reason Network engine and notifying
 connected agent sessions. The workflow should:
 
 1. build or install the selected engine version on this computer;
