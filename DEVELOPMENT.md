@@ -89,3 +89,17 @@ Each run record should include:
 The first useful operations are `list_runs`, `show_run`, `resume_run`, and `restart_run`. Records should survive daemon
 restarts, distinguish a resumed conversation from a fresh attempt, and retain failed runs for diagnosis. The directory
 must not store credentials or full transcripts by default.
+
+### Coordinated restart workflow
+
+Use `/restart` in the coordinator conversation as the shorthand for refreshing the Reason Network engine and notifying
+connected agent sessions. The workflow should:
+
+1. build or install the selected engine version on this computer;
+2. restart the local daemon and verify its version;
+3. notify each connected agent that its Reason Network tools need a reload;
+4. report which sessions acknowledged the new version and which still need their conversation reopened;
+5. avoid interrupting a busy worker unless the user explicitly asks for a forced restart.
+
+Some clients can reload their MCP connection during the current conversation; others only load MCP tools when a new
+conversation starts. The coordinator should make that difference visible instead of claiming every session restarted.
