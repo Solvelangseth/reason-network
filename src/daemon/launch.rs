@@ -13,6 +13,7 @@ use std::{
     sync::Arc,
     time::Duration,
 };
+use tokio::io::AsyncReadExt;
 use ulid::Ulid;
 
 pub const FEATURE: &str = "launch";
@@ -166,7 +167,7 @@ async fn start(agent_name: &str, cwd: &Path, prompt: &str) -> Result<()> {
     let bin_name = if agent_name == agent::CLAUDE_CODE { "claude" } else { agent_name };
     let bin = agent::find_bin(bin_name).ok_or_else(|| anyhow!("{bin_name} is not installed on this machine"))?;
     let mut cmd = tokio::process::Command::new(bin);
-    cmd.current_dir(cwd).stdin(Stdio::null());
+    cmd.current_dir(cwd).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
     // The daemon may have been started on demand from inside another agent's shell. None of that caller's session
     // identity belongs to the child; each launched harness establishes its own identity.
     for name in [
@@ -195,17 +196,41 @@ async fn start(agent_name: &str, cwd: &Path, prompt: &str) -> Result<()> {
     }
     match agent_name {
         agent::CLAUDE_CODE => {
-            cmd.arg("--bg").arg(prompt).stdout(Stdio::null()).stderr(Stdio::null());
+            cmd.arg("--bg").arg(prompt);
         }
         "codex" => {
-            cmd.arg("exec").arg(prompt).stdout(Stdio::null()).stderr(Stdio::null());
+            cmd.arg("exec").arg(prompt);
         }
         "opencode" => {
-            cmd.arg("run").arg(prompt).stdout(Stdio::null()).stderr(Stdio::null());
+            cmd.arg("run").arg(prompt);
         }
         _ => unreachable!(),
     }
-    cmd.kill_on_drop(false).spawn().map_err(|e| anyhow!("could not start {bin_name}: {e}"))?;
+    let mut child = cmd.kill_on_drop(false).spawn().map_err(|e| anyhow!("could not start {bin_name}: {e}"))?;
+    let mut stderr = child.stderr.take();
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    if let Some(status) = child.try_wait().map_err(|e| anyhow!("could not inspect {bin_name}: {e}"))? {
+        let mut detail = String::new();
+        if let Some(mut pipe) = stderr.take() {
+            let _ = pipe.read_to_string(&mut detail).await;
+        }
+        if !status.success() {
+            let detail = detail.trim();
+            bail!(
+                "{bin_name} exited before starting{}",
+                if detail.is_empty() { String::new() } else { format!(": {detail}") }
+            );
+        }
+    } else {
+        // Reap the long-running worker and drain its diagnostics without tying its lifetime to this request.
+        tokio::spawn(async move {
+            if let Some(mut pipe) = stderr {
+                let mut sink = Vec::new();
+                let _ = pipe.read_to_end(&mut sink).await;
+            }
+            let _ = child.wait().await;
+        });
+    }
     super::log(&format!("launch {agent_name} in {}", cwd.display()));
     Ok(())
 }
