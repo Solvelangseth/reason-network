@@ -54,19 +54,30 @@ other directly about the interface, and Claude reviews. Every failure goes to `l
 
 ## Phase 2: finish `feat/agent-launch`
 
-1. Rebase on `main` (0.12.11), fix conflicts, get CI green.
-2. Fix the known gap: `opencode run` doesn't register as an addressable session (replies showed up as
+The coordinator does the whole setup of a worker, with no steps for you: it creates the folder or worktree, starts the
+agent with its task and the coordinator's address, and the session opens in a window you can watch and type into.
+
+1. **Visible launch.** Today `start_agent` runs workers headless. Add a visible mode: the agent runs inside a named
+   `tmux` session (`rn-<task>`), so it outlives its window and can be reattached, and a terminal window attached to
+   it pops open (Linux: `xdg-terminal-exec` / `uwsm-app`, a Hyprland workspace per worker; macOS: `open -a Terminal`).
+   Headless stays available for remote machines and CI.
+2. **Workspace setup.** `start_agent` takes a repo plus a task name and creates `git worktree add ../<repo>-<task> -b
+   <task>` itself (or an empty folder for scratch work), refusing paths outside the allowed roots.
+3. **Pre-wired sessions.** The launched session gets a chosen name (`<repo>-<task>-<agent>`, not generated suffixes)
+   and the coordinator's address in its first prompt, and shows up in `who` before `start_agent` returns.
+4. Rebase on `main` (0.12.11), fix conflicts, get CI green.
+5. Fix the known gap: `opencode run` doesn't register as an addressable session (replies showed up as
    `solve/terminal`).
-3. Fix the Claude Code workspace-trust failure on launch, or report it clearly enough to act on.
-4. Test `start_agent` for all three agents, local and across machines (laptop ↔ MacBook), on the dev network.
-5. Open the PR. This is the base for everything after it: the coordinator can now start workers itself.
+6. Fix the Claude Code workspace-trust failure on launch, or report it clearly enough to act on.
+7. Test `start_agent` for all three agents, local and across machines (laptop ↔ MacBook), on the dev network.
+8. Open the PR. This is the base for everything after it: the coordinator can now start workers itself.
 
 ## Phase 3: features, built by the agent team
 
 In this order. Each is one PR, done by a worker the coordinator launches and reviewed by another agent:
 
 1. **opencode session identity**: the right cwd/repo in the listing, stale sessions expire when the end event is
-   missed. Small, well scoped, a good first task for a worker.
+   missed. Reproduced 2026-10-29: three opencode sessions opened in different folders all listed as `~`. Small, well scoped, a good first task for a worker.
 2. **Run directory**: `list_runs`, `show_run`, `resume_run`, `restart_run`. Records survive daemon restarts and keep
    the task, coordinator, status and last report. No transcripts or credentials.
 3. **Workgroups**: a coordinator-scoped group whose members message each other freely and contact the coordinator
